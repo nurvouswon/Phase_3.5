@@ -35,34 +35,54 @@ st.title("🏆 MLB Home Run Predictor — State of the Art, Phase 1")
 @st.cache_data(show_spinner=False, max_entries=2)
 def safe_read_cached(path):
     from io import BytesIO
+    import os, tempfile
 
-    # Get a stable filename string
     name = str(getattr(path, "name", path)).lower()
 
-    # If parquet, read via bytes → BytesIO and prefer pyarrow, fallback to fastparquet
     if name.endswith(".parquet"):
-        # Pull bytes from UploadedFile or file path
+        # pull file bytes first (works for UploadedFile or file path)
         try:
-            if hasattr(path, "getvalue"):  # Streamlit UploadedFile
+            if hasattr(path, "getvalue"):
                 data = path.getvalue()
             else:
                 with open(path, "rb") as f:
                     data = f.read()
         except Exception as e:
-            st.error(f"Couldn't read the parquet file bytes: {e}")
+            st.error(f"Couldn't read parquet file bytes: {e}")
             st.stop()
 
-        # Try pyarrow first, then fastparquet
-        last_err = None
-        for eng in ("pyarrow", "fastparquet"):
-            try:
-                return pd.read_parquet(BytesIO(data), engine=eng)
-            except Exception as e:
-                last_err = e
-                continue
+        # 1) pyarrow
+        try:
+            import pyarrow.parquet as pq
+            table = pq.read_table(BytesIO(data))
+            return table.to_pandas()
+        except Exception as e_pa:
+            last_err = e_pa
+
+        # 2) fastparquet
+        try:
+            import fastparquet as fp
+            # fastparquet wants a file-like with .read/.seek
+            return fp.ParquetFile(BytesIO(data)).to_pandas()
+        except Exception as e_fp:
+            last_err = e_fp
+
+        # 3) duckdb fallback (write to a temp file, then read)
+        try:
+            import duckdb, pandas as pd
+            with tempfile.TemporaryDirectory() as td:
+                tmp = os.path.join(td, "upload.parquet")
+                with open(tmp, "wb") as f:
+                    f.write(data)
+                con = duckdb.connect(":memory:")
+                df = con.execute(f"SELECT * FROM read_parquet('{tmp}')").fetchdf()
+                con.close()
+                return df
+        except Exception as e_duck:
+            last_err = e_duck
 
         st.error(
-            "Failed to read Parquet. Make sure either **pyarrow** or **fastparquet** is installed.\n\n"
+            "Failed to read Parquet with pyarrow, fastparquet, and duckdb.\n\n"
             f"Last error: {last_err}"
         )
         st.stop()
@@ -72,6 +92,7 @@ def safe_read_cached(path):
         return pd.read_csv(path, low_memory=False)
     except UnicodeDecodeError:
         return pd.read_csv(path, encoding="latin1", low_memory=False)
+
 def dedup_columns(df):
     return df.loc[:, ~df.columns.duplicated()]
 
