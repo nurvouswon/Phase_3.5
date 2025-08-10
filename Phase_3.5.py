@@ -707,38 +707,77 @@ if event_file is not None and today_file is not None:
         te_maps[name] = fmap
         global_means[name] = gmean
 
-    # Map TE to today
+    # ---------- SAFE TE MAPPING TO TODAY (exactly match training columns) ----------
     def _map_series_to_te(series, fmap, gmean):
         s = series.fillna("__NA__").astype(str)
         return s.map(lambda v: fmap.get(v, gmean)).astype(np.float32)
 
-    if "park" in today_df.columns:
-        X_today["te_park"] = _map_series_to_te(today_df["park"], te_maps.get("te_park", {}), global_means.get("te_park", y.mean()))
-    if "team_code" in today_df.columns:
-        X_today["te_team"] = _map_series_to_te(today_df["team_code"], te_maps.get("te_team", {}), global_means.get("te_team", y.mean()))
-    if set(["park","batter_hand"]).issubset(today_df.columns):
-        X_today["te_park_hand"] = _map_series_to_te(
-            _combo(today_df["park"], today_df["batter_hand"]),
-            te_maps.get("te_park_hand", {}),
-            global_means.get("te_park_hand", y.mean())
-        )
-    if set(["pitcher_team_code","batter_hand"]).issubset(today_df.columns):
-        X_today["te_pteam_hand"] = _map_series_to_te(
-            _combo(today_df["pitcher_team_code"], today_df["batter_hand"]),
-            te_maps.get("te_pteam_hand", {}),
-            global_means.get("te_pteam_hand", y.mean())
-        )
+    # Which TE columns actually exist in the TRAIN matrix?
+    te_in_train = set([c for c in ["te_park", "te_team", "te_park_hand", "te_pteam_hand"] if c in X.columns])
 
-    # Fill learnable wind-to-pull flag for today (train was 0.0 to avoid leakage)
-    if "wind_dir_string" in today_df.columns and "stand" in today_df.columns:
-        wdir = today_df["wind_dir_string"].astype(str).str.lower().fillna("")
-        hand = today_df["stand"].astype(str).str.upper().fillna("R")
-        pulled_field = np.where(hand == "R", "lf", "rf")
-        out_to_pull = wdir.str.contains("out") & (
-            ((pulled_field == "lf") & wdir.str.contains("lf")) |
-            ((pulled_field == "rf") & wdir.str.contains("rf"))
-        )
-        X_today["feat_pull_wind"] = out_to_pull.astype(np.float32)
+    # Helper to add or fill a TE column so X_today matches X
+    def _add_or_fill_te(colname, raw_series_or_none, fmap, gmean):
+        if colname in te_in_train:
+            if raw_series_or_none is not None:
+                X_today[colname] = _map_series_to_te(raw_series_or_none, fmap, gmean)
+            else:
+            # Raw pieces missing in today_df -> fill with global mean so column still exists
+                X_today[colname] = np.float32(gmean)
+
+    # te_park
+    _add_or_fill_te(
+        "te_park",
+        today_df["park"] if "park" in today_df.columns else None,
+        te_maps.get("te_park", {}),
+        global_means.get("te_park", float(y.mean()))
+    )
+
+    # te_team
+    _add_or_fill_te(
+        "te_team",
+        today_df["team_code"] if "team_code" in today_df.columns else None,
+        te_maps.get("te_team", {}),
+        global_means.get("te_team", float(y.mean()))
+    )
+
+    # te_park_hand
+    _add_or_fill_te(
+        "te_park_hand",
+        _combo(today_df["park"], today_df["batter_hand"]) if {"park","batter_hand"}.issubset(today_df.columns) else None,
+        te_maps.get("te_park_hand", {}),
+        global_means.get("te_park_hand", float(y.mean()))
+    )
+
+    # te_pteam_hand
+    _add_or_fill_te(
+        "te_pteam_hand",
+        _combo(today_df["pitcher_team_code"], today_df["batter_hand"]) if {"pitcher_team_code","batter_hand"}.issubset(today_df.columns) else None,
+        te_maps.get("te_pteam_hand", {}),
+        global_means.get("te_pteam_hand", float(y.mean()))
+    )
+
+    # ---------- FEAT_PULL_WIND for TODAY (only if the model was trained with it) ----------
+    if "feat_pull_wind" in X.columns:
+        if "wind_dir_string" in today_df.columns and ("stand" in today_df.columns or "batter_hand" in today_df.columns):
+            wdir = today_df["wind_dir_string"].astype(str).str.lower().fillna("")
+            hand = (today_df["stand"] if "stand" in today_df.columns else today_df["batter_hand"]).astype(str).str.upper().fillna("R")
+            pulled_field = np.where(hand == "R", "lf", "rf")
+            out_to_pull = wdir.str.contains("out") & (
+                ((pulled_field == "lf") & wdir.str.contains("lf")) |
+                ((pulled_field == "rf") & wdir.str.contains("rf"))
+            )
+            X_today["feat_pull_wind"] = out_to_pull.astype(np.float32)
+        else:
+       # Inputs missing today -> keep column, fill neutral
+            X_today["feat_pull_wind"] = np.float32(0.0)
+
+    # ---------- FINAL: force exact same columns/order/dtypes as training ----------
+    for c in X.columns:
+        if c not in X_today.columns:
+            X_today[c] = np.float32(-1.0)
+
+    # Drop any extra cols that aren't in training and order to match
+    X_today = X_today[X.columns].astype(np.float32)
 
     # ========== Train/Validation via Embargoed Time Splits ==========
     # imbalance handling
