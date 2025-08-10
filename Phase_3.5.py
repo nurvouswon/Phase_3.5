@@ -946,11 +946,88 @@ if event_file is not None and today_file is not None:
         today_df[col] = ratings_df[col]
 
     today_df["overlay_multiplier"] = today_df.apply(overlay_multiplier, axis=1)
+    # === Weak / Slumping Pitcher Overlay (additive to weather overlay) ===
+    def _first_non_null(row, *cands, default=np.nan):
+        """Return the first present, non-null value among candidate columns."""
+        for c in cands:
+            if c in row and pd.notnull(row[c]):
+                return row[c]
+        return default
 
+    def weak_pitcher_factor(row):
+        """
+        Multiplies probability for pitchers who are (recently) homer-prone.
+        Uses short-window HR/PA allowed, barrels allowed, flyball tendency,
+        hard contact allowed, and platoon edge. Clamped conservatively.
+        """
+        factor = 1.0
+
+        # --- Short-term HR allowed (use any available window) ---
+        hr3, pa3 = _first_non_null(row, "p_rolling_hr_3", "p_hr_count_3", default=np.nan), \
+                   _first_non_null(row, "p_rolling_pa_3", default=np.nan)
+        if pd.notnull(hr3) and pd.notnull(pa3) and pa3 > 0:
+            hr_rate_short = float(hr3) / float(pa3)
+            if hr_rate_short >= 0.10:      # ~1 HR per 10 PA
+                factor *= 1.10
+            elif hr_rate_short >= 0.07:
+                factor *= 1.05
+
+        # --- Barrels allowed recently (fallback across windows) ---
+        p_brl14 = _first_non_null(row,
+                                  "p_fs_barrel_rate_14", "p_barrel_rate_14",
+                                  "p_hard_hit_rate_14",  # weaker proxy
+                                      default=np.nan)
+            if pd.notnull(p_brl14):
+                v = float(p_brl14)
+        # If this is actually "hard hit rate", the thresholds still behave conservatively
+                if v >= 0.10:
+                    factor *= 1.07
+                elif v >= 0.08:
+                    factor *= 1.04
+
+        # --- Flyball tendency (rate or percent) ---
+            p_fb = _first_non_null(row,
+                                   "p_fb_rate_14", "p_fb_rate_7", "p_fb_rate",
+                                   "p_fb_pct",  # some feeds use pct naming
+                               default=np.nan)
+        if pd.notnull(p_fb):
+            if float(p_fb) >= 0.40:
+                factor *= 1.05
+
+        # --- Hard contact / EV allowed (pick best available) ---
+        p_ev = _first_non_null(row,
+                               "p_avg_exit_velo_14", "p_avg_exit_velo_7", "p_avg_exit_velo_30",
+                               "p_exit_velocity_avg", "p_avg_exit_velo",
+                               default=np.nan)
+        if pd.notnull(p_ev) and float(p_ev) >= 90.0:
+            factor *= 1.04
+
+    # --- Platoon edge for batter vs pitcher ---
+        b_hand = str(_first_non_null(row, "stand", "batter_hand", default="R")).upper()
+        p_hand = str(_first_non_null(row, "pitcher_hand", "p_throws", default="R")).upper()
+        if (b_hand == "L" and p_hand == "R") or (b_hand == "R" and p_hand == "L"):
+            factor *= 1.02
+
+    # Clamp for sanity
+        return float(np.clip(factor, 0.90, 1.15))
+
+# Compute & combine with your existing weather overlay
+    today_df["weak_pitcher_factor"] = today_df.apply(weak_pitcher_factor, axis=1).astype(np.float32)
+    today_df["final_multiplier"] = (
+        today_df["overlay_multiplier"].astype(float).clip(0.68, 1.44)
+        * today_df["weak_pitcher_factor"].astype(float)
+    ).clip(0.60, 1.65).astype(np.float32)
+
+# >>> IMPORTANT: if you previously did:
+# log_overlay = np.log(today_df["overlay_multiplier"].clip(0.68, 1.44).values + 1e-9)
+# REPLACE it with final_multiplier below, and keep the rest of your scoring the same.
+
+# Replace your existing log_overlay line with this:
+    log_overlay = np.log(today_df["final_multiplier"].values + 1e-9)
     # ---- Blended final score: prob + overlay + ranker ----
     p_base = today_iso_t
     logit_p = logit(np.clip(p_base, 1e-6, 1-1e-6))
-    log_overlay = np.log(today_df["overlay_multiplier"].clip(0.68, 1.44).values + 1e-9)
+    log_overlay = np.log(today_df["final_multiplier"].values + 1e-9)
     ranker_z = zscore(ranker_today)
 
     w_prob, w_overlay, w_ranker = 0.6, 0.2, 0.2
