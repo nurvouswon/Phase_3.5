@@ -651,6 +651,29 @@ if event_file is not None and today_file is not None:
     st.write(f"✅ Final training matrix: {X.shape}")
     st.write("🎯 Feature engineering complete.")
 
+    # --- Pin columns: make X_today EXACTLY match training X ---
+    X = dedup_columns(X)
+    X_today = dedup_columns(X_today)
+
+    # Ensure string column names
+    X.columns = X.columns.astype(str)
+    X_today.columns = X_today.columns.astype(str)
+
+    # Drop anything extra in today
+    extra_today = [c for c in X_today.columns if c not in X.columns]
+    if extra_today:
+        X_today = X_today.drop(columns=extra_today, errors="ignore")
+
+    # Add any missing columns to today and order to match X
+    missing_today = [c for c in X.columns if c not in X_today.columns]
+    for c in missing_today:
+        X_today[c] = -1
+
+    X_today = X_today[X.columns]  # exact same order as training
+
+    # Final safety checks
+    X_today = X_today.fillna(-1)
+    nan_inf_check(X_today, "X_today (after pin)")
     # ---------- Target Encoding setup ----------
     # Build categoricals aligned to X rows from original event_df ordering
     cat_cols_available = [c for c in ["park","team_code","batter_hand","pitcher_team_code"] if c in event_df.columns]
