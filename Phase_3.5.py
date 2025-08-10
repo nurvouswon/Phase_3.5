@@ -34,14 +34,33 @@ st.title("🏆 MLB Home Run Predictor — State of the Art, Phase 1")
 # ===================== Helpers / Utilities =====================
 @st.cache_data(show_spinner=False, max_entries=2)
 def safe_read_cached(path):
-    fn = str(getattr(path, 'name', path)).lower()
-    if fn.endswith('.parquet'):
-        return pd.read_parquet(path)
+    fn = str(getattr(path, 'name', path))
+    lower = fn.lower()
+
+    # Parquet (prefer pyarrow)
+    if lower.endswith(('.parquet', '.pq')):
+        try:
+            import pyarrow  # noqa: F401
+            return pd.read_parquet(path, engine="pyarrow")
+        except Exception as e:
+            st.error(
+                "Couldn't read Parquet. Make sure `pyarrow` is installed and matches your Python version. "
+                "I expected it from requirements (pyarrow==15.0.2). "
+                f"\n\nDetails: {e}"
+            )
+            st.stop()
+
+    # Compressed CSVs
+    if lower.endswith('.gz'):
+        return pd.read_csv(path, compression='gzip', low_memory=False)
+    if lower.endswith('.zip'):
+        return pd.read_csv(path, compression='zip', low_memory=False)
+
+    # Plain CSV / TXT
     try:
         return pd.read_csv(path, low_memory=False)
     except UnicodeDecodeError:
         return pd.read_csv(path, encoding='latin1', low_memory=False)
-
 def dedup_columns(df):
     return df.loc[:, ~df.columns.duplicated()]
 
