@@ -34,33 +34,44 @@ st.title("🏆 MLB Home Run Predictor — State of the Art, Phase 1")
 # ===================== Helpers / Utilities =====================
 @st.cache_data(show_spinner=False, max_entries=2)
 def safe_read_cached(path):
-    fn = str(getattr(path, 'name', path))
-    lower = fn.lower()
+    from io import BytesIO
 
-    # Parquet (prefer pyarrow)
-    if lower.endswith(('.parquet', '.pq')):
+    # Get a stable filename string
+    name = str(getattr(path, "name", path)).lower()
+
+    # If parquet, read via bytes → BytesIO and prefer pyarrow, fallback to fastparquet
+    if name.endswith(".parquet"):
+        # Pull bytes from UploadedFile or file path
         try:
-            import pyarrow  # noqa: F401
-            return pd.read_parquet(path, engine="pyarrow")
+            if hasattr(path, "getvalue"):  # Streamlit UploadedFile
+                data = path.getvalue()
+            else:
+                with open(path, "rb") as f:
+                    data = f.read()
         except Exception as e:
-            st.error(
-                "Couldn't read Parquet. Make sure `pyarrow` is installed and matches your Python version. "
-                "I expected it from requirements (pyarrow==15.0.2). "
-                f"\n\nDetails: {e}"
-            )
+            st.error(f"Couldn't read the parquet file bytes: {e}")
             st.stop()
 
-    # Compressed CSVs
-    if lower.endswith('.gz'):
-        return pd.read_csv(path, compression='gzip', low_memory=False)
-    if lower.endswith('.zip'):
-        return pd.read_csv(path, compression='zip', low_memory=False)
+        # Try pyarrow first, then fastparquet
+        last_err = None
+        for eng in ("pyarrow", "fastparquet"):
+            try:
+                return pd.read_parquet(BytesIO(data), engine=eng)
+            except Exception as e:
+                last_err = e
+                continue
 
-    # Plain CSV / TXT
+        st.error(
+            "Failed to read Parquet. Make sure either **pyarrow** or **fastparquet** is installed.\n\n"
+            f"Last error: {last_err}"
+        )
+        st.stop()
+
+    # CSV path
     try:
         return pd.read_csv(path, low_memory=False)
     except UnicodeDecodeError:
-        return pd.read_csv(path, encoding='latin1', low_memory=False)
+        return pd.read_csv(path, encoding="latin1", low_memory=False)
 def dedup_columns(df):
     return df.loc[:, ~df.columns.duplicated()]
 
