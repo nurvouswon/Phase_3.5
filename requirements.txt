@@ -7,8 +7,9 @@ lightgbm==4.3.0
 catboost==1.2.5
 matplotlib==3.9.0
 shap==0.45.1
-betacal
+betacal>=1.0.0,<2
 psutil==5.9.8
 python-dateutil==2.9.0.post0
-pyarrow==16.1.0
-fastparquet==2024.5.0
+pyarrow==16.1.0         # optional but preferred if it installs
+fastparquet==2024.5.0   # optional
+duckdb==1.0.0           # robust Parquet fallback
