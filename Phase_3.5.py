@@ -868,130 +868,128 @@ if event_file is not None and today_file is not None:
     ).clip(0.60, 1.65).astype(np.float32)
 
     # ---- Blended final score: prob + overlay + ranker ----
-# p_base is the calibrated probability stream. Prefer temp-tuned isotonic; fall back safely.
-try:
-    p_base = today_iso_t
-except NameError:
+    # p_base is the calibrated probability stream. Prefer temp-tuned isotonic; fall back safely.
     try:
-        p_base = today_iso
+        p_base = today_iso_t
     except NameError:
-        p_base = P_today_meta  # raw meta prob as last resort
-
-logit_p = logit(np.clip(p_base, 1e-6, 1 - 1e-6))
-log_overlay = np.log(today_df["final_multiplier"].values + 1e-9)
-
-# If you trained the day-wise ranker earlier, we use it; otherwise fall back safely.
-try:
-    ranker_z = zscore(ranker_today)
-except NameError:
-    ranker_z = np.zeros_like(p_base, dtype=np.float32)
-
-# ---- Blended final score: prob + overlay + ranker ----
-w_prob, w_overlay, w_ranker = 0.6, 0.2, 0.2
-score = expit(w_prob * logit_p + w_overlay * log_overlay + w_ranker * ranker_z)
-
-# ---- Build leaderboard (rank by blended score) ----
-def build_leaderboard(df, calibrated_probs, final_score, label="calibrated_hr_probability"):
-    df = df.copy()
-    df[label] = np.asarray(calibrated_probs)
-    df["ranked_probability"] = np.asarray(final_score)
-
-    # Sort and basic ranking
-    df = df.sort_values("ranked_probability", ascending=False).reset_index(drop=True)
-    df["hr_base_rank"] = df[label].rank(method="min", ascending=False)
-
-    # Columns to show
-    leaderboard_cols = []
-    for c in ["player_name", "team_code", "time"]:
-        if c in df.columns:
-            leaderboard_cols.append(c)
-
-    leaderboard_cols += [
-        label, "ranked_probability",
-        # Overlays
-        "overlay_multiplier", "weak_pitcher_factor", "final_multiplier",
-        # Weather context
-        "temp", "temp_rating",
-        "humidity", "humidity_rating",
-        "wind_mph", "wind_rating",
-        "wind_dir_string", "condition", "condition_rating",
-    ]
-
-    # Keep only those that exist
-    leaderboard_cols = [c for c in leaderboard_cols if c in df.columns]
-
-    leaderboard = df[leaderboard_cols].copy()
-
-    # Nicely rounded views
-    if label in leaderboard.columns:
-        leaderboard[label] = leaderboard[label].round(4)
-    if "ranked_probability" in leaderboard.columns:
-        leaderboard["ranked_probability"] = leaderboard["ranked_probability"].round(4)
-    for c in ["overlay_multiplier", "weak_pitcher_factor", "final_multiplier"]:
-        if c in leaderboard.columns:
-            leaderboard[c] = leaderboard[c].astype(float).round(3)
-
-    return leaderboard
-
-leaderboard = build_leaderboard(today_df, p_base, score, "hr_probability_iso_T")
-
-# ===== Outputs =====
-top_n = 30
-st.markdown(f"### 🏆 **Top {top_n} HR Leaderboard (Meta + Isotonic + Temp + Ranker + Weather & Weak-Pitcher Overlay)**")
-leaderboard_top = leaderboard.head(top_n)
-st.dataframe(leaderboard_top, use_container_width=True)
-
-st.download_button(
-    f"⬇️ Download Top {top_n} Leaderboard CSV",
-    data=leaderboard_top.to_csv(index=False),
-    file_name=f"top{top_n}_leaderboard_blended.csv"
-)
-
-st.download_button(
-    "⬇️ Download Full Prediction CSV (Blended)",
-    data=leaderboard.to_csv(index=False),
-    file_name="today_hr_predictions_full_blended.csv"
-)
-
-# Leaderboard plot
-if "player_name" in leaderboard_top.columns and "ranked_probability" in leaderboard_top.columns:
-    st.subheader(f"📊 Ranked Probability Distribution (Top {top_n})")
-    fig, ax = plt.subplots(figsize=(10, 7))
-    ax.barh(leaderboard_top["player_name"].astype(str), leaderboard_top["ranked_probability"])
-    ax.invert_yaxis()
-    ax.set_xlabel('Ranked HR Score (probability scale)')
-    ax.set_ylabel('Player')
-    st.pyplot(fig)
-    plt.close(fig)
-
-# Drift diagnostics
-try:
-    drifted = drift_check(X, X_today, n=6)
-    if drifted:
-        st.markdown("#### ⚡ **Feature Drift Diagnostics**")
-        st.write("These features have unusual mean/std changes between training and today, check if input context shifted:", drifted)
-except Exception:
-    pass
-
-# Prediction histogram
-if "ranked_probability" in leaderboard.columns:
-    st.subheader("Prediction Probability Distribution (all predictions, Blended)")
-    plt.figure(figsize=(8, 3))
-    plt.hist(leaderboard["ranked_probability"], bins=30, alpha=0.7)
-    plt.xlabel("Ranked HR Probability")
-    plt.ylabel("Count")
-    st.pyplot(plt.gcf())
-    plt.close()
-
-# Memory cleanup
-try:
-    del X, X_today, y
-except Exception:
-    pass
-for varname in ["P_xgb_oof", "P_lgb_oof", "P_cat_oof", "P_xgb_today", "P_lgb_today", "P_cat_today"]:
-    if varname in globals():
         try:
-            del globals()[varname]
-        except Exception:
-            pass
-gc.collect()
+            p_base = today_iso
+        except NameError:
+            p_base = P_today_meta  # raw meta prob as last resort
+
+    logit_p = logit(np.clip(p_base, 1e-6, 1 - 1e-6))
+    log_overlay = np.log(today_df["final_multiplier"].values + 1e-9)
+
+    # If you trained the day-wise ranker earlier, we use it; otherwise fall back safely.
+    try:
+        ranker_z = zscore(ranker_today)
+    except NameError:
+        ranker_z = np.zeros_like(p_base, dtype=np.float32)
+
+    w_prob, w_overlay, w_ranker = 0.6, 0.2, 0.2
+    score = expit(w_prob * logit_p + w_overlay * log_overlay + w_ranker * ranker_z)
+
+    # ---- Build leaderboard (rank by blended score) ----
+    def build_leaderboard(df, calibrated_probs, final_score, label="calibrated_hr_probability"):
+        df = df.copy()
+        df[label] = np.asarray(calibrated_probs)
+        df["ranked_probability"] = np.asarray(final_score)
+
+        # Sort and basic ranking
+        df = df.sort_values("ranked_probability", ascending=False).reset_index(drop=True)
+        df["hr_base_rank"] = df[label].rank(method="min", ascending=False)
+
+        # Columns to show
+        leaderboard_cols = []
+        for c in ["player_name", "team_code", "time"]:
+            if c in df.columns:
+                leaderboard_cols.append(c)
+
+        leaderboard_cols += [
+            label, "ranked_probability",
+            # Overlays
+            "overlay_multiplier", "weak_pitcher_factor", "final_multiplier",
+            # Weather context
+            "temp", "temp_rating",
+            "humidity", "humidity_rating",
+            "wind_mph", "wind_rating",
+            "wind_dir_string", "condition", "condition_rating",
+        ]
+
+        # Keep only those that exist
+        leaderboard_cols = [c for c in leaderboard_cols if c in df.columns]
+        leaderboard = df[leaderboard_cols].copy()
+
+        # Nicely rounded views
+        if label in leaderboard.columns:
+            leaderboard[label] = leaderboard[label].round(4)
+        if "ranked_probability" in leaderboard.columns:
+            leaderboard["ranked_probability"] = leaderboard["ranked_probability"].round(4)
+        for c in ["overlay_multiplier", "weak_pitcher_factor", "final_multiplier"]:
+            if c in leaderboard.columns:
+                leaderboard[c] = leaderboard[c].astype(float).round(3)
+
+        return leaderboard
+
+    leaderboard = build_leaderboard(today_df, p_base, score, "hr_probability_iso_T")
+
+    # ===== Outputs =====
+    top_n = 30
+    st.markdown(f"### 🏆 **Top {top_n} HR Leaderboard (Meta + Isotonic + Temp + Ranker + Weather & Weak-Pitcher Overlay)**")
+    leaderboard_top = leaderboard.head(top_n)
+    st.dataframe(leaderboard_top, use_container_width=True)
+
+    st.download_button(
+        f"⬇️ Download Top {top_n} Leaderboard CSV",
+        data=leaderboard_top.to_csv(index=False),
+        file_name=f"top{top_n}_leaderboard_blended.csv"
+    )
+
+    st.download_button(
+        "⬇️ Download Full Prediction CSV (Blended)",
+        data=leaderboard.to_csv(index=False),
+        file_name="today_hr_predictions_full_blended.csv"
+    )
+
+    # Leaderboard plot
+    if "player_name" in leaderboard_top.columns and "ranked_probability" in leaderboard_top.columns:
+        st.subheader(f"📊 Ranked Probability Distribution (Top {top_n})")
+        fig, ax = plt.subplots(figsize=(10, 7))
+        ax.barh(leaderboard_top["player_name"].astype(str), leaderboard_top["ranked_probability"])
+        ax.invert_yaxis()
+        ax.set_xlabel('Ranked HR Score (probability scale)')
+        ax.set_ylabel('Player')
+        st.pyplot(fig)
+        plt.close(fig)
+
+    # Drift diagnostics
+    try:
+        drifted = drift_check(X, X_today, n=6)
+        if drifted:
+            st.markdown("#### ⚡ **Feature Drift Diagnostics**")
+            st.write("These features have unusual mean/std changes between training and today, check if input context shifted:", drifted)
+    except Exception:
+        pass
+
+    # Prediction histogram
+    if "ranked_probability" in leaderboard.columns:
+        st.subheader("Prediction Probability Distribution (all predictions, Blended)")
+        plt.figure(figsize=(8, 3))
+        plt.hist(leaderboard["ranked_probability"], bins=30, alpha=0.7)
+        plt.xlabel("Ranked HR Probability")
+        plt.ylabel("Count")
+        st.pyplot(plt.gcf())
+        plt.close()
+
+    # Memory cleanup
+    try:
+        del X, X_today, y
+    except Exception:
+        pass
+    for varname in ["P_xgb_oof", "P_lgb_oof", "P_cat_oof", "P_xgb_today", "P_lgb_today", "P_cat_today"]:
+        if varname in globals():
+            try:
+                del globals()[varname]
+            except Exception:
+                pass
+    gc.collect()
