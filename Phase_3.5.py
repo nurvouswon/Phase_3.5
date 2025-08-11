@@ -5,27 +5,23 @@ import gc
 import time
 import psutil
 from datetime import timedelta
+from collections import defaultdict
 
 from sklearn.metrics import roc_auc_score, log_loss
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, PolynomialFeatures
 from sklearn.linear_model import LogisticRegression
 from sklearn.neighbors import LocalOutlierFactor
 from sklearn.ensemble import IsolationForest
-from sklearn.preprocessing import PolynomialFeatures
+from sklearn.isotonic import IsotonicRegression
 
 import xgboost as xgb
 import lightgbm as lgb
 import catboost as cb
 
-from sklearn.isotonic import IsotonicRegression
-from betacal import BetaCalibration
-
 import matplotlib.pyplot as plt
 import shap
 
 from scipy.special import logit, expit
-from collections import defaultdict
-from math import isfinite
 
 # ===================== UI =====================
 st.set_page_config(page_title="🏆 MLB Home Run Predictor — State of the Art, Phase 1", layout="wide")
@@ -64,7 +60,7 @@ def fix_types(df):
 def clean_X(df, train_cols=None):
     df = dedup_columns(df)
     df = fix_types(df)
-    allowed_obj = {'wind_dir_string', 'condition', 'player_name', 'city', 'park', 'roof_status', 'team_code', 'time'}
+    allowed_obj = {'wind_dir_string','condition','player_name','city','park','roof_status','team_code','time','batter_hand','pitcher_team_code','pitcher_hand','stand'}
     drop_cols = [c for c in df.select_dtypes('O').columns if c not in allowed_obj]
     df = df.drop(columns=drop_cols, errors='ignore')
     df = df.fillna(-1)
@@ -94,7 +90,7 @@ def nan_inf_check(X, name):
         st.stop()
 
 def feature_debug(X):
-    X.columns = X.columns.astype(str)  # Ensure column names are strings
+    X.columns = X.columns.astype(str)
     st.write("🛡️ Feature Debugging:")
     st.write("Data types:", X.dtypes.value_counts())
     object_cols = X.select_dtypes(include="object").columns.tolist()
@@ -130,14 +126,8 @@ def winsorize_clip(X, limits=(0.01, 0.99)):
     return X
 
 def remove_outliers(
-    X,
-    y,
-    method="iforest",
-    contamination=0.012,
-    n_estimators=100,
-    max_samples='auto',
-    n_neighbors=20,
-    scale=True
+    X, y, method="iforest", contamination=0.012,
+    n_estimators=100, max_samples='auto', n_neighbors=20, scale=True
 ):
     if scale:
         scaler = StandardScaler()
@@ -153,10 +143,7 @@ def remove_outliers(
         )
         mask = clf.fit_predict(X_scaled) == 1
     elif method == "lof":
-        clf = LocalOutlierFactor(
-            contamination=contamination,
-            n_neighbors=n_neighbors
-        )
+        clf = LocalOutlierFactor(contamination=contamination, n_neighbors=n_neighbors)
         mask = clf.fit_predict(X_scaled) == 1
     else:
         raise ValueError("Unknown method: choose 'iforest' or 'lof'")
@@ -170,35 +157,23 @@ def smooth_labels(y, smoothing=0.02):
     return y_smooth
 
 # ---------------- Target Encoding (time-safe OOF) ----------------
-def oof_target_encode(values, y, dates, folds, global_prior=None, min_count=10, smoothing=50.0):
-    """
-    values: pd.Series of categories (aligned to X)
-    y:      pd.Series/array of 0/1
-    dates:  pd.Series datetime (aligned to X)
-    folds:  iterable of (tr_idx, va_idx)
-    returns: oof_enc (np.ndarray), mapping dict, global_mean
-    """
+def oof_target_encode(values, y, dates, folds, global_prior=None, smoothing=50.0):
     y = np.asarray(y).astype(float)
     if global_prior is None:
         global_prior = y.mean() if len(y) else 0.0
 
     full_ct = values.value_counts(dropna=False)
-    grp_sum = defaultdict(float)
-    grp_cnt = defaultdict(float)
+    grp_sum = defaultdict(float); grp_cnt = defaultdict(float)
     for v, target in zip(values.fillna("__NA__"), y):
-        grp_sum[v] += target
-        grp_cnt[v] += 1.0
+        grp_sum[v] += target; grp_cnt[v] += 1.0
 
     oof = np.zeros(len(values), dtype=np.float32)
-
     for tr_idx, va_idx in folds:
         tr_vals = values.iloc[tr_idx].fillna("__NA__")
         tr_y    = y[tr_idx]
-        sum_d = defaultdict(float)
-        cnt_d = defaultdict(float)
+        sum_d = defaultdict(float); cnt_d = defaultdict(float)
         for v, t in zip(tr_vals, tr_y):
-            sum_d[v] += t
-            cnt_d[v] += 1.0
+            sum_d[v] += t; cnt_d[v] += 1.0
         te_map = {}
         for v in set(tr_vals):
             c = cnt_d.get(v, 0.0)
@@ -218,10 +193,6 @@ def oof_target_encode(values, y, dates, folds, global_prior=None, min_count=10, 
 
 # ---------------- Embargoed time splits ----------------
 def embargo_time_splits(dates_series, n_splits=5, embargo_days=1):
-    """
-    Build chronological folds with an embargo (purge) of N days before each val period.
-    Returns a list of (train_idx, val_idx).
-    """
     dates = pd.to_datetime(dates_series).reset_index(drop=True)
     u_days = pd.Series(dates.dt.floor("D")).dropna().unique()
     u_days = pd.to_datetime(u_days)
@@ -243,18 +214,17 @@ def embargo_time_splits(dates_series, n_splits=5, embargo_days=1):
             folds.append((tr_idx, va_idx))
     return folds
 
-# ---------------- Light tools ----------------
+# ---------------- Misc tools ----------------
 def zscore(a):
     a = np.asarray(a, dtype=np.float64)
-    mu = np.nanmean(a)
-    sd = np.nanstd(a) + 1e-9
+    mu = np.nanmean(a); sd = np.nanstd(a) + 1e-9
     return (a - mu) / sd
 
 def tune_temperature_for_topk(p_oof, y, K=20, T_grid=np.linspace(0.8, 1.6, 17)):
     y = np.asarray(y).astype(int)
     best_T, best_hits = 1.0, -1
+    logits = logit(np.clip(p_oof, 1e-6, 1-1e-6))
     for T in T_grid:
-        logits = logit(np.clip(p_oof, 1e-6, 1 - 1e-6))
         p_adj = expit(logits * T)
         order = np.argsort(-p_adj)
         hits = int(y[order][:K].sum())
@@ -339,7 +309,6 @@ def overlay_multiplier(row):
         elif humidity <= 35: edge *= 0.98
 
     pulled_field = "lf" if b_hand == "R" else "rf"
-    oppo_field   = "rf" if b_hand == "R" else "lf"
 
     wind_factor = 1.0
     if pd.notnull(wind) and wind >= 6 and wind_dir:
@@ -369,8 +338,8 @@ def overlay_multiplier(row):
             wind_factor *= OUT_PULL_BOOST if out else IN_PULL_FADE if inn else 1.0
 
         if out and lo_pull:
-            if has_lf and oppo_field == "lf": wind_factor *= OPPO_TINY
-            if has_rf and oppo_field == "rf": wind_factor *= OPPO_TINY
+            if has_lf and pulled_field == "rf": wind_factor *= OPPO_TINY
+            if has_rf and pulled_field == "lf": wind_factor *= OPPO_TINY
 
         if hi_pfb and (out or inn):
             wind_factor *= 1.05 if out else 0.97
@@ -432,19 +401,9 @@ def rate_weather(row):
     elif 6 <= wind < 12:
         ratings["wind_rating"] = "Good"
     elif 12 <= wind < 18:
-        if "out" in wdir:
-            ratings["wind_rating"] = "Good"
-        elif "in" in wdir:
-            ratings["wind_rating"] = "Fair"
-        else:
-            ratings["wind_rating"] = "Fair"
+        ratings["wind_rating"] = "Fair" if "in" in wdir else "Good"
     else:
-        if "out" in wdir:
-            ratings["wind_rating"] = "Fair"
-        elif "in" in wdir:
-            ratings["wind_rating"] = "Poor"
-        else:
-            ratings["wind_rating"] = "Poor"
+        ratings["wind_rating"] = "Poor" if "in" in wdir else "Fair"
 
     cond = str(_getv(row, ["condition"], "")).lower()
     if not cond or cond in ("unknown","none","na"):
@@ -458,6 +417,46 @@ def rate_weather(row):
     else:
         ratings["condition_rating"] = "Fair"
     return pd.Series(ratings)
+
+# -------- Weak / Slumping Pitcher Overlay --------
+def _first_non_null(row, *cands, default=np.nan):
+    for c in cands:
+        if c in row and pd.notnull(row[c]):
+            return row[c]
+    return default
+
+def weak_pitcher_factor(row):
+    factor = 1.0
+    hr3 = _first_non_null(row, "p_rolling_hr_3", "p_hr_count_3", default=np.nan)
+    pa3 = _first_non_null(row, "p_rolling_pa_3", default=np.nan)
+    if pd.notnull(hr3) and pd.notnull(pa3) and pa3 > 0:
+        hr_rate_short = float(hr3) / float(pa3)
+        if hr_rate_short >= 0.10:
+            factor *= 1.10
+        elif hr_rate_short >= 0.07:
+            factor *= 1.05
+
+    p_brl14 = _first_non_null(row, "p_fs_barrel_rate_14", "p_barrel_rate_14", "p_hard_hit_rate_14", default=np.nan)
+    if pd.notnull(p_brl14):
+        v = float(p_brl14)
+        if v >= 0.10: factor *= 1.07
+        elif v >= 0.08: factor *= 1.04
+
+    p_fb = _first_non_null(row, "p_fb_rate_14", "p_fb_rate_7", "p_fb_rate", "p_fb_pct", default=np.nan)
+    if pd.notnull(p_fb) and float(p_fb) >= 0.40:
+        factor *= 1.05
+
+    p_ev = _first_non_null(row, "p_avg_exit_velo_14", "p_avg_exit_velo_7", "p_avg_exit_velo_30",
+                           "p_exit_velocity_avg", "p_avg_exit_velo", default=np.nan)
+    if pd.notnull(p_ev) and float(p_ev) >= 90.0:
+        factor *= 1.04
+
+    b_hand = str(_first_non_null(row, "stand", "batter_hand", default="R")).upper()
+    p_hand = str(_first_non_null(row, "pitcher_hand", "p_throws", default="R")).upper()
+    if (b_hand == "L" and p_hand == "R") or (b_hand == "R" and p_hand == "L"):
+        factor *= 1.02
+
+    return float(np.clip(factor, 0.90, 1.15))
 
 # ===================== APP START =====================
 event_file = st.file_uploader("Upload Event-Level CSV/Parquet for Training (required)", type=['csv', 'parquet'], key='eventcsv')
@@ -477,10 +476,10 @@ if event_file is not None and today_file is not None:
         today_df = today_df.reset_index(drop=True)
 
         if find_duplicate_columns(event_df):
-            st.error(f"Duplicate columns in event file")
+            st.error("Duplicate columns in event file")
             st.stop()
         if find_duplicate_columns(today_df):
-            st.error(f"Duplicate columns in today file")
+            st.error("Duplicate columns in today file")
             st.stop()
 
         # Type fixes
@@ -497,8 +496,7 @@ if event_file is not None and today_file is not None:
         st.stop()
     st.success("✅ 'hr_outcome' column found in event-level data.")
 
-    # ---- Feature Filtering ----
-    # Drop known leakage / post hoc columns explicitly
+    # ---- Leak-prone drop ----
     LEAK = {
         "post_away_score","post_home_score","post_bat_score","post_fld_score",
         "delta_home_win_exp","delta_run_exp","delta_pitcher_run_exp",
@@ -509,6 +507,7 @@ if event_file is not None and today_file is not None:
     }
     event_df = event_df.drop(columns=[c for c in event_df.columns if c in LEAK], errors="ignore")
 
+    # ---- Feature list intersection ----
     feature_cols = sorted(list(set(get_valid_feature_cols(event_df)) & set(get_valid_feature_cols(today_df))))
     st.write(f"Feature count before filtering: {len(feature_cols)}")
 
@@ -517,6 +516,7 @@ if event_file is not None and today_file is not None:
 
     feature_debug(X)
 
+    # ---- Prune: NaN heavy, near-constant, dup-correlated ----
     nan_thresh = 0.3
     nan_pct = X.isna().mean()
     drop_cols = nan_pct[nan_pct > nan_thresh].index.tolist()
@@ -542,7 +542,7 @@ if event_file is not None and today_file is not None:
     X = winsorize_clip(X)
     X_today = winsorize_clip(X_today)
 
-    # --- Optional: polynomial crosses (OFF by default to save memory)
+    # --- Optional: polynomial crosses (OFF by default) ---
     use_crosses = st.checkbox("Enable polynomial interaction crosses (slow, memory heavy)", value=False)
     if use_crosses:
         try:
@@ -566,7 +566,7 @@ if event_file is not None and today_file is not None:
         except Exception as e:
             st.error(f"❌ Cross-feature generation failed: {str(e)}")
 
-    # --- Add two cheap synergy features (tiny memory, good lift)
+    # --- Cheap synergy feats ---
     def add_synergy_feats(df_ref, df_today_ref):
         for df in (df_ref, df_today_ref):
             if "b_fb_rate_7" in df.columns and "park_hr_rate" in df.columns:
@@ -598,18 +598,14 @@ if event_file is not None and today_file is not None:
     X = add_micro_feats(X)
     X_today = add_micro_feats(X_today)
 
-    # ---- Time-aware ordering BEFORE outlier removal ----
+    # ---- Chronological ordering BEFORE outlier removal ----
     y = event_df[target_col].astype(int)
 
     order_idx = None
     if "game_date" in event_df.columns:
         dates = pd.to_datetime(event_df["game_date"], errors="coerce")
         min_date = dates.min()
-        if pd.isna(min_date):
-            st.warning("All game_date values are NaT; skipping chronological ordering.")
-            dates_filled = dates
-        else:
-            dates_filled = dates.fillna(min_date)
+        dates_filled = dates if pd.isna(min_date) else dates.fillna(min_date)
         order_idx = dates_filled.sort_values(kind="mergesort").index
         X = X.loc[order_idx].reset_index(drop=True)
         y = y.loc[order_idx].reset_index(drop=True)
@@ -625,18 +621,15 @@ if event_file is not None and today_file is not None:
     # --- Outlier removal ---
     st.write("🚦 Starting outlier removal...")
     X_filtered, y_filtered = remove_outliers(X, y, method="iforest", contamination=0.012)
-    # subset dates with same index, then reset all
     dates_aligned = dates_aligned.loc[X_filtered.index].reset_index(drop=True)
     X = X_filtered.reset_index(drop=True).copy()
     y = pd.Series(y_filtered).reset_index(drop=True)
     st.write(f"✅ Outlier removal complete. Rows remaining: {X.shape[0]}")
 
-    # --- Fill missing values ---
+    # --- Fill missing, cast ---
     st.write("🩹 Filling missing values...")
     X = X.fillna(-1)
     X_today = X_today.fillna(-1)
-
-    # --- Convert to float32 for memory ---
     try:
         X = X.astype(np.float32)
         X_today = X_today.astype(np.float32)
@@ -644,38 +637,7 @@ if event_file is not None and today_file is not None:
     except Exception as e:
         st.error(f"❌ Conversion to float32 failed: {e}")
 
-    # --- Debug view ---
-    feature_debug(X_today)
-    st.dataframe(X_today.head(500))  # cap preview
-
-    st.write(f"✅ Final training matrix: {X.shape}")
-    st.write("🎯 Feature engineering complete.")
-
-    # --- Pin columns: make X_today EXACTLY match training X ---
-    X = dedup_columns(X)
-    X_today = dedup_columns(X_today)
-
-    # Ensure string column names
-    X.columns = X.columns.astype(str)
-    X_today.columns = X_today.columns.astype(str)
-
-    # Drop anything extra in today
-    extra_today = [c for c in X_today.columns if c not in X.columns]
-    if extra_today:
-        X_today = X_today.drop(columns=extra_today, errors="ignore")
-
-    # Add any missing columns to today and order to match X
-    missing_today = [c for c in X.columns if c not in X_today.columns]
-    for c in missing_today:
-        X_today[c] = -1
-
-    X_today = X_today[X.columns]  # exact same order as training
-
-    # Final safety checks
-    X_today = X_today.fillna(-1)
-    nan_inf_check(X_today, "X_today (after pin)")
     # ---------- Target Encoding setup ----------
-    # Build categoricals aligned to X rows from original event_df ordering
     cat_cols_available = [c for c in ["park","team_code","batter_hand","pitcher_team_code"] if c in event_df.columns]
     cats_full = event_df[cat_cols_available].copy()
     if order_idx is not None:
@@ -695,7 +657,6 @@ if event_file is not None and today_file is not None:
     if set(["pitcher_team_code","batter_hand"]).issubset(cats_full.columns):
         te_specs.append(("te_pteam_hand", _combo(cats_full["pitcher_team_code"], cats_full["batter_hand"])))
 
-    # Build embargoed time folds
     n_splits = 5
     folds = embargo_time_splits(dates_aligned, n_splits=n_splits, embargo_days=1)
 
@@ -707,80 +668,54 @@ if event_file is not None and today_file is not None:
         te_maps[name] = fmap
         global_means[name] = gmean
 
-    # ---------- SAFE TE MAPPING TO TODAY (exactly match training columns) ----------
+    # Map TE to today
     def _map_series_to_te(series, fmap, gmean):
         s = series.fillna("__NA__").astype(str)
         return s.map(lambda v: fmap.get(v, gmean)).astype(np.float32)
 
-    # Which TE columns actually exist in the TRAIN matrix?
-    te_in_train = set([c for c in ["te_park", "te_team", "te_park_hand", "te_pteam_hand"] if c in X.columns])
+    if "park" in today_df.columns:
+        X_today["te_park"] = _map_series_to_te(today_df["park"], te_maps.get("te_park", {}), global_means.get("te_park", y.mean()))
+    if "team_code" in today_df.columns:
+        X_today["te_team"] = _map_series_to_te(today_df["team_code"], te_maps.get("te_team", {}), global_means.get("te_team", y.mean()))
+    if set(["park","batter_hand"]).issubset(today_df.columns):
+        X_today["te_park_hand"] = _map_series_to_te(_combo(today_df["park"], today_df["batter_hand"]),
+                                                    te_maps.get("te_park_hand", {}), global_means.get("te_park_hand", y.mean()))
+    if set(["pitcher_team_code","batter_hand"]).issubset(today_df.columns):
+        X_today["te_pteam_hand"] = _map_series_to_te(_combo(today_df["pitcher_team_code"], today_df["batter_hand"]),
+                                                     te_maps.get("te_pteam_hand", {}), global_means.get("te_pteam_hand", y.mean()))
 
-    # Helper to add or fill a TE column so X_today matches X
-    def _add_or_fill_te(colname, raw_series_or_none, fmap, gmean):
-        if colname in te_in_train:
-            if raw_series_or_none is not None:
-                X_today[colname] = _map_series_to_te(raw_series_or_none, fmap, gmean)
-            else:
-            # Raw pieces missing in today_df -> fill with global mean so column still exists
-                X_today[colname] = np.float32(gmean)
+    # Fill learnable wind-to-pull flag for today (train was 0.0 to avoid leakage)
+    if "wind_dir_string" in today_df.columns and "stand" in today_df.columns:
+        wdir = today_df["wind_dir_string"].astype(str).str.lower().fillna("")
+        hand = today_df["stand"].astype(str).str.upper().fillna("R")
+        pulled_field = np.where(hand == "R", "lf", "rf")
+        out_to_pull = wdir.str.contains("out") & (
+            ((pulled_field == "lf") & wdir.str.contains("lf")) |
+            ((pulled_field == "rf") & wdir.str.contains("rf"))
+        )
+        X_today["feat_pull_wind"] = out_to_pull.astype(np.float32)
 
-    # te_park
-    _add_or_fill_te(
-        "te_park",
-        today_df["park"] if "park" in today_df.columns else None,
-        te_maps.get("te_park", {}),
-        global_means.get("te_park", float(y.mean()))
-    )
+    # === FINAL COLUMN PINNING (after all feature engineering, incl. TE) ===
+    X = dedup_columns(X); X_today = dedup_columns(X_today)
+    X.columns = X.columns.astype(str); X_today.columns = X_today.columns.astype(str)
+    extra_today = sorted(set(X_today.columns) - set(X.columns))
+    if extra_today:
+        st.warning(f"Dropping {len(extra_today)} extra today cols (e.g. {extra_today[:8]})")
+        X_today = X_today.drop(columns=extra_today, errors="ignore")
+    missing_today = sorted(set(X.columns) - set(X_today.columns))
+    for c in missing_today: X_today[c] = -1
+    X_today = X_today[X.columns]
+    X_today = X_today.fillna(-1)
+    nan_inf_check(X_today, "X_today (pinned)")
+    st.write(f"✅ Columns pinned. Train cols: {X.shape[1]} | Today cols: {X_today.shape[1]}")
 
-    # te_team
-    _add_or_fill_te(
-        "te_team",
-        today_df["team_code"] if "team_code" in today_df.columns else None,
-        te_maps.get("te_team", {}),
-        global_means.get("te_team", float(y.mean()))
-    )
-
-    # te_park_hand
-    _add_or_fill_te(
-        "te_park_hand",
-        _combo(today_df["park"], today_df["batter_hand"]) if {"park","batter_hand"}.issubset(today_df.columns) else None,
-        te_maps.get("te_park_hand", {}),
-        global_means.get("te_park_hand", float(y.mean()))
-    )
-
-    # te_pteam_hand
-    _add_or_fill_te(
-        "te_pteam_hand",
-        _combo(today_df["pitcher_team_code"], today_df["batter_hand"]) if {"pitcher_team_code","batter_hand"}.issubset(today_df.columns) else None,
-        te_maps.get("te_pteam_hand", {}),
-        global_means.get("te_pteam_hand", float(y.mean()))
-    )
-
-    # ---------- FEAT_PULL_WIND for TODAY (only if the model was trained with it) ----------
-    if "feat_pull_wind" in X.columns:
-        if "wind_dir_string" in today_df.columns and ("stand" in today_df.columns or "batter_hand" in today_df.columns):
-            wdir = today_df["wind_dir_string"].astype(str).str.lower().fillna("")
-            hand = (today_df["stand"] if "stand" in today_df.columns else today_df["batter_hand"]).astype(str).str.upper().fillna("R")
-            pulled_field = np.where(hand == "R", "lf", "rf")
-            out_to_pull = wdir.str.contains("out") & (
-                ((pulled_field == "lf") & wdir.str.contains("lf")) |
-                ((pulled_field == "rf") & wdir.str.contains("rf"))
-            )
-            X_today["feat_pull_wind"] = out_to_pull.astype(np.float32)
-        else:
-       # Inputs missing today -> keep column, fill neutral
-            X_today["feat_pull_wind"] = np.float32(0.0)
-
-    # ---------- FINAL: force exact same columns/order/dtypes as training ----------
-    for c in X.columns:
-        if c not in X_today.columns:
-            X_today[c] = np.float32(-1.0)
-
-    # Drop any extra cols that aren't in training and order to match
-    X_today = X_today[X.columns].astype(np.float32)
+    # --- Debug view ---
+    feature_debug(X_today)
+    st.dataframe(X_today.head(500))
+    st.write(f"✅ Final training matrix: {X.shape}")
+    st.write("🎯 Feature engineering complete.")
 
     # ========== Train/Validation via Embargoed Time Splits ==========
-    # imbalance handling
     pos = float(y.sum())
     neg = float(len(y) - pos)
 
@@ -824,11 +759,7 @@ if event_file is not None and today_file is not None:
             )
 
             xgb_clf.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
-            lgb_clf.fit(
-                X_tr, y_tr,
-                eval_set=[(X_va, y_va)],
-                callbacks=[lgb.early_stopping(50), lgb.log_evaluation(0)]
-            )
+            lgb_clf.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], callbacks=[lgb.early_stopping(50), lgb.log_evaluation(0)])
             cat_clf.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
 
             preds_xgb_va.append(xgb_clf.predict_proba(X_va)[:,1])
@@ -839,7 +770,6 @@ if event_file is not None and today_file is not None:
             preds_lgb_td.append(lgb_clf.predict_proba(X_today)[:,1])
             preds_cat_td.append(cat_clf.predict_proba(X_today)[:,1])
 
-        # seed-averaged per fold
         P_xgb_oof[va_idx] = np.mean(preds_xgb_va, axis=0)
         P_lgb_oof[va_idx] = np.mean(preds_lgb_va, axis=0)
         P_cat_oof[va_idx] = np.mean(preds_cat_va, axis=0)
@@ -848,7 +778,6 @@ if event_file is not None and today_file is not None:
         P_lgb_today.append(np.mean(preds_lgb_td, axis=0))
         P_cat_today.append(np.mean(preds_cat_td, axis=0))
 
-        # Optional SHAP (only once to save time)
         if fold == 0 and show_shap:
             with st.spinner("Computing SHAP values (this can be slow)..."):
                 explainer = shap.TreeExplainer(xgb_clf)
@@ -876,11 +805,8 @@ if event_file is not None and today_file is not None:
     for fold, (tr_idx, va_idx) in enumerate(folds):
         X_tr, X_va = X.iloc[tr_idx], X.iloc[va_idx]
         y_tr, y_va = y.iloc[tr_idx], y.iloc[va_idx]
-        d_tr = days.iloc[tr_idx]
-        d_va = days.iloc[va_idx]
-
-        g_tr = _groups_from_days(d_tr)
-        g_va = _groups_from_days(d_va)
+        d_tr = days.iloc[tr_idx]; d_va = days.iloc[va_idx]
+        g_tr = _groups_from_days(d_tr); g_va = _groups_from_days(d_va)
 
         rk = lgb.LGBMRanker(
             objective="lambdarank", metric="ndcg",
@@ -888,13 +814,8 @@ if event_file is not None and today_file is not None:
             feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1,
             random_state=fold
         )
-        rk.fit(
-            X_tr, y_tr,
-            group=g_tr,
-            eval_set=[(X_va, y_va)],
-            eval_group=[g_va],
-            callbacks=[lgb.early_stopping(50), lgb.log_evaluation(0)]
-        )
+        rk.fit(X_tr, y_tr, group=g_tr, eval_set=[(X_va, y_va)], eval_group=[g_va],
+               callbacks=[lgb.early_stopping(50), lgb.log_evaluation(0)])
         ranker_oof[va_idx] = rk.predict(X_va)
         ranker_today_parts.append(rk.predict(X_today))
 
@@ -926,14 +847,6 @@ if event_file is not None and today_file is not None:
     y_oof_iso = ir.fit_transform(oof_pred_meta, y.values)
     today_iso = ir.transform(P_today_meta)
 
-    # Optional BetaCalibration for comparison (kept for your display parity)
-    bc = BetaCalibration(parameters="abm")
-    bc.fit(oof_pred_meta.reshape(-1,1), y.values)
-    y_oof_beta = bc.predict(oof_pred_meta.reshape(-1,1))
-
-    st.write(f"**Isotonic (OOF):**   AUC = {roc_auc_score(y, y_oof_iso):.4f}   |   LogLoss = {log_loss(y, y_oof_iso):.4f}")
-    st.write(f"**BetaCal  (OOF):**   AUC = {roc_auc_score(y, y_oof_beta):.4f}  |   LogLoss = {log_loss(y, y_oof_beta):.4f}")
-
     # ---- Temperature tuning for Top-K ----
     best_T = tune_temperature_for_topk(y_oof_iso, y.values, K=20, T_grid=np.linspace(0.8, 1.6, 17))
     logits_today = logit(np.clip(today_iso, 1e-6, 1-1e-6))
@@ -946,156 +859,122 @@ if event_file is not None and today_file is not None:
         today_df[col] = ratings_df[col]
 
     today_df["overlay_multiplier"] = today_df.apply(overlay_multiplier, axis=1)
-    # === Weak / Slumping Pitcher Overlay (additive to weather overlay) ===
-    def _first_non_null(row, *cands, default=np.nan):
-        """Return the first present, non-null value among candidate columns."""
-        for c in cands:
-            if c in row and pd.notnull(row[c]):
-                return row[c]
-        return default
 
-    def weak_pitcher_factor(row):
-        """
-        Multiplies probability for pitchers who are (recently) homer-prone.
-        Uses short-window HR/PA allowed, barrels allowed, flyball tendency,
-        hard contact allowed, and platoon edge. Clamped conservatively.
-        """
-        factor = 1.0
-
-        # --- Short-term HR allowed (use any available window) ---
-        hr3, pa3 = _first_non_null(row, "p_rolling_hr_3", "p_hr_count_3", default=np.nan), \
-                   _first_non_null(row, "p_rolling_pa_3", default=np.nan)
-        if pd.notnull(hr3) and pd.notnull(pa3) and pa3 > 0:
-            hr_rate_short = float(hr3) / float(pa3)
-            if hr_rate_short >= 0.10:      # ~1 HR per 10 PA
-                factor *= 1.10
-            elif hr_rate_short >= 0.07:
-                factor *= 1.05
-
-        # --- Barrels allowed recently (fallback across windows) ---
-        p_brl14 = _first_non_null(row,
-                                  "p_fs_barrel_rate_14", "p_barrel_rate_14",
-                                  "p_hard_hit_rate_14",  # weaker proxy
-                                      default=np.nan)
-            if pd.notnull(p_brl14):
-                v = float(p_brl14)
-        # If this is actually "hard hit rate", the thresholds still behave conservatively
-                if v >= 0.10:
-                    factor *= 1.07
-                elif v >= 0.08:
-                    factor *= 1.04
-
-        # --- Flyball tendency (rate or percent) ---
-            p_fb = _first_non_null(row,
-                                   "p_fb_rate_14", "p_fb_rate_7", "p_fb_rate",
-                                   "p_fb_pct",  # some feeds use pct naming
-                               default=np.nan)
-        if pd.notnull(p_fb):
-            if float(p_fb) >= 0.40:
-                factor *= 1.05
-
-        # --- Hard contact / EV allowed (pick best available) ---
-        p_ev = _first_non_null(row,
-                               "p_avg_exit_velo_14", "p_avg_exit_velo_7", "p_avg_exit_velo_30",
-                               "p_exit_velocity_avg", "p_avg_exit_velo",
-                               default=np.nan)
-        if pd.notnull(p_ev) and float(p_ev) >= 90.0:
-            factor *= 1.04
-
-    # --- Platoon edge for batter vs pitcher ---
-        b_hand = str(_first_non_null(row, "stand", "batter_hand", default="R")).upper()
-        p_hand = str(_first_non_null(row, "pitcher_hand", "p_throws", default="R")).upper()
-        if (b_hand == "L" and p_hand == "R") or (b_hand == "R" and p_hand == "L"):
-            factor *= 1.02
-
-    # Clamp for sanity
-        return float(np.clip(factor, 0.90, 1.15))
-
-# Compute & combine with your existing weather overlay
+    # ---- Weak pitcher factor & final multiplier ----
     today_df["weak_pitcher_factor"] = today_df.apply(weak_pitcher_factor, axis=1).astype(np.float32)
     today_df["final_multiplier"] = (
         today_df["overlay_multiplier"].astype(float).clip(0.68, 1.44)
         * today_df["weak_pitcher_factor"].astype(float)
     ).clip(0.60, 1.65).astype(np.float32)
 
-# >>> IMPORTANT: if you previously did:
-# log_overlay = np.log(today_df["overlay_multiplier"].clip(0.68, 1.44).values + 1e-9)
-# REPLACE it with final_multiplier below, and keep the rest of your scoring the same.
-
-# Replace your existing log_overlay line with this:
-    log_overlay = np.log(today_df["final_multiplier"].values + 1e-9)
     # ---- Blended final score: prob + overlay + ranker ----
+# p_base is the calibrated probability stream. Prefer temp-tuned isotonic; fall back safely.
+try:
     p_base = today_iso_t
-    logit_p = logit(np.clip(p_base, 1e-6, 1-1e-6))
-    log_overlay = np.log(today_df["final_multiplier"].values + 1e-9)
+except NameError:
+    try:
+        p_base = today_iso
+    except NameError:
+        p_base = P_today_meta  # raw meta prob as last resort
+
+logit_p = logit(np.clip(p_base, 1e-6, 1 - 1e-6))
+log_overlay = np.log(today_df["final_multiplier"].values + 1e-9)
+
+# If you trained the day-wise ranker earlier, we use it; otherwise fall back safely.
+try:
     ranker_z = zscore(ranker_today)
+except NameError:
+    ranker_z = np.zeros_like(p_base, dtype=np.float32)
 
-    w_prob, w_overlay, w_ranker = 0.6, 0.2, 0.2
-    score = expit(w_prob * logit_p + w_overlay * log_overlay + w_ranker * ranker_z)
+# ---- Blended final score: prob + overlay + ranker ----
+w_prob, w_overlay, w_ranker = 0.6, 0.2, 0.2
+score = expit(w_prob * logit_p + w_overlay * log_overlay + w_ranker * ranker_z)
 
-    # ---- Build leaderboard (rank by blended score) ----
-    def build_leaderboard(df, calibrated_probs, final_score, label="calibrated_hr_probability"):
-        df = df.copy()
-        df[label] = calibrated_probs
-        df["ranked_probability"] = final_score
-        df = df.sort_values("ranked_probability", ascending=False).reset_index(drop=True)
-        df['hr_base_rank'] = df[label].rank(method='min', ascending=False)
+# ---- Build leaderboard (rank by blended score) ----
+def build_leaderboard(df, calibrated_probs, final_score, label="calibrated_hr_probability"):
+    df = df.copy()
+    df[label] = np.asarray(calibrated_probs)
+    df["ranked_probability"] = np.asarray(final_score)
 
-        leaderboard_cols = []
-        for c in ["player_name", "team_code", "time"]:
-            if c in df.columns: leaderboard_cols.append(c)
+    # Sort and basic ranking
+    df = df.sort_values("ranked_probability", ascending=False).reset_index(drop=True)
+    df["hr_base_rank"] = df[label].rank(method="min", ascending=False)
 
-        leaderboard_cols += [
-            label, "overlay_multiplier", "ranked_probability",
-            "temp", "temp_rating",
-            "humidity", "humidity_rating",
-            "wind_mph", "wind_rating",
-            "wind_dir_string", "condition", "condition_rating"
-        ]
-        leaderboard = df[leaderboard_cols].copy()
+    # Columns to show
+    leaderboard_cols = []
+    for c in ["player_name", "team_code", "time"]:
+        if c in df.columns:
+            leaderboard_cols.append(c)
+
+    leaderboard_cols += [
+        label, "ranked_probability",
+        # Overlays
+        "overlay_multiplier", "weak_pitcher_factor", "final_multiplier",
+        # Weather context
+        "temp", "temp_rating",
+        "humidity", "humidity_rating",
+        "wind_mph", "wind_rating",
+        "wind_dir_string", "condition", "condition_rating",
+    ]
+
+    # Keep only those that exist
+    leaderboard_cols = [c for c in leaderboard_cols if c in df.columns]
+
+    leaderboard = df[leaderboard_cols].copy()
+
+    # Nicely rounded views
+    if label in leaderboard.columns:
         leaderboard[label] = leaderboard[label].round(4)
+    if "ranked_probability" in leaderboard.columns:
         leaderboard["ranked_probability"] = leaderboard["ranked_probability"].round(4)
-        leaderboard["overlay_multiplier"] = leaderboard["overlay_multiplier"].round(3)
-        return leaderboard
+    for c in ["overlay_multiplier", "weak_pitcher_factor", "final_multiplier"]:
+        if c in leaderboard.columns:
+            leaderboard[c] = leaderboard[c].astype(float).round(3)
 
-    leaderboard = build_leaderboard(today_df, p_base, score, "hr_probability_iso_T")
+    return leaderboard
 
-    # ===== Outputs =====
-    top_n = 30
-    st.markdown(f"### 🏆 **Top {top_n} HR Leaderboard (Meta + Isotonic + Temp + Ranker + Overlay)**")
-    leaderboard_top = leaderboard.head(top_n)
-    st.dataframe(leaderboard_top, use_container_width=True)
+leaderboard = build_leaderboard(today_df, p_base, score, "hr_probability_iso_T")
 
-    st.download_button(
-        f"⬇️ Download Top {top_n} Leaderboard CSV",
-        data=leaderboard_top.to_csv(index=False),
-        file_name=f"top{top_n}_leaderboard_blended.csv"
-    )
+# ===== Outputs =====
+top_n = 30
+st.markdown(f"### 🏆 **Top {top_n} HR Leaderboard (Meta + Isotonic + Temp + Ranker + Weather & Weak-Pitcher Overlay)**")
+leaderboard_top = leaderboard.head(top_n)
+st.dataframe(leaderboard_top, use_container_width=True)
 
-    st.download_button(
-        "⬇️ Download Full Prediction CSV (Blended)",
-        data=leaderboard.to_csv(index=False),
-        file_name="today_hr_predictions_full_blended.csv"
-    )
+st.download_button(
+    f"⬇️ Download Top {top_n} Leaderboard CSV",
+    data=leaderboard_top.to_csv(index=False),
+    file_name=f"top{top_n}_leaderboard_blended.csv"
+)
 
-    # Leaderboard plot
-    if "player_name" in leaderboard_top.columns:
-        st.subheader(f"📊 Ranked Probability Distribution (Top {top_n})")
-        fig, ax = plt.subplots(figsize=(10, 7))
-        ax.barh(leaderboard_top["player_name"].astype(str), leaderboard_top["ranked_probability"])
-        ax.invert_yaxis()
-        ax.set_xlabel('Ranked HR Score (probability scale)')
-        ax.set_ylabel('Player')
-        st.pyplot(fig)
-        plt.close(fig)
+st.download_button(
+    "⬇️ Download Full Prediction CSV (Blended)",
+    data=leaderboard.to_csv(index=False),
+    file_name="today_hr_predictions_full_blended.csv"
+)
 
-    # Drift diagnostics
+# Leaderboard plot
+if "player_name" in leaderboard_top.columns and "ranked_probability" in leaderboard_top.columns:
+    st.subheader(f"📊 Ranked Probability Distribution (Top {top_n})")
+    fig, ax = plt.subplots(figsize=(10, 7))
+    ax.barh(leaderboard_top["player_name"].astype(str), leaderboard_top["ranked_probability"])
+    ax.invert_yaxis()
+    ax.set_xlabel('Ranked HR Score (probability scale)')
+    ax.set_ylabel('Player')
+    st.pyplot(fig)
+    plt.close(fig)
+
+# Drift diagnostics
+try:
     drifted = drift_check(X, X_today, n=6)
     if drifted:
         st.markdown("#### ⚡ **Feature Drift Diagnostics**")
         st.write("These features have unusual mean/std changes between training and today, check if input context shifted:", drifted)
+except Exception:
+    pass
 
-    # Prediction histogram
+# Prediction histogram
+if "ranked_probability" in leaderboard.columns:
     st.subheader("Prediction Probability Distribution (all predictions, Blended)")
     plt.figure(figsize=(8, 3))
     plt.hist(leaderboard["ranked_probability"], bins=30, alpha=0.7)
@@ -1104,9 +983,15 @@ if event_file is not None and today_file is not None:
     st.pyplot(plt.gcf())
     plt.close()
 
-    # Memory cleanup
-    del X, X_today, y, P_xgb_oof, P_lgb_oof, P_cat_oof, P_xgb_today, P_lgb_today, P_cat_today
-    gc.collect()
-
-else:
-    st.warning("Upload both event-level and today CSVs (CSV or Parquet) to begin.")
+# Memory cleanup
+try:
+    del X, X_today, y
+except Exception:
+    pass
+for varname in ["P_xgb_oof", "P_lgb_oof", "P_cat_oof", "P_xgb_today", "P_lgb_today", "P_cat_today"]:
+    if varname in globals():
+        try:
+            del globals()[varname]
+        except Exception:
+            pass
+gc.collect()
