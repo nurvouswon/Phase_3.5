@@ -888,7 +888,116 @@ if event_file is not None and today_file is not None:
 
     w_prob, w_overlay, w_ranker = 0.6, 0.2, 0.2
     score = expit(w_prob * logit_p + w_overlay * log_overlay + w_ranker * ranker_z)
+    # ===================== BLEND TUNER =====================
+    st.markdown("## 🔧 Blend Tuner")
+    if "hr_outcome" not in today_df.columns:
+        st.info("To use the Blend Tuner, your TODAY file must include a column named **hr_outcome** (1 if the batter homered, 0 otherwise). Tuner skipped.")
+    else:
+        y_true = today_df["hr_outcome"].fillna(0).astype(int).to_numpy()
+        if y_true.sum() == 0 or y_true.sum() == len(y_true):
+            st.warning("Blend Tuner needs both 0s and 1s in hr_outcome. Tuner skipped.")
+        else:
+            # Helpers
+            def score_with_weights(wp, wo, wr, a_logit, b_logoverlay, c_ranker):
+                z = wp * a_logit + wo * b_logoverlay + wr * c_ranker
+                return expit(z)
 
+            def hits_at_k(y, s, K):
+                order = np.argsort(-s)
+                return int(np.sum(y[order][:K]))
+
+            def dcg_at_k(rels, K):
+                rels = np.asarray(rels)[:K]
+                if rels.size == 0:
+                    return 0.0
+                discounts = 1.0 / np.log2(np.arange(2, 2 + len(rels)))
+                return float(np.sum(rels * discounts))
+
+            def ndcg_at_k(y, s, K):
+                order = np.argsort(-s)
+                rel_sorted = y[order]
+                dcg = dcg_at_k(rel_sorted, K)
+                ideal = np.sort(y)[::-1]
+                idcg = dcg_at_k(ideal, K)
+                return (dcg / idcg) if idcg > 0 else 0.0
+
+            # Grid of weights (we normalize to sum to 1)
+            prob_grid    = [0.40, 0.50, 0.60, 0.70]
+            overlay_grid = [0.10, 0.20, 0.25, 0.30]
+            ranker_min   = 0.05
+
+            results = []
+            for wp in prob_grid:
+                for wo in overlay_grid:
+                    wr = 1.0 - wp - wo
+                    if wr < ranker_min:
+                        continue
+                    # Compute blended score
+                    s = score_with_weights(wp, wo, wr, logit_p, log_overlay, ranker_z)
+
+                    # Metrics
+                    h10 = hits_at_k(y_true, s, 10)
+                    h20 = hits_at_k(y_true, s, 20)
+                    h30 = hits_at_k(y_true, s, 30)
+                    ndcg30 = ndcg_at_k(y_true, s, 30)
+                    try:
+                        auc = roc_auc_score(y_true, s)
+                    except Exception:
+                        auc = np.nan
+
+                    results.append({
+                        "w_prob": round(wp, 2),
+                        "w_overlay": round(wo, 2),
+                        "w_ranker": round(wr, 2),
+                        "Hits@10": h10,
+                        "Hits@20": h20,
+                        "Hits@30": h30,
+                        "NDCG@30": round(ndcg30, 4),
+                        "AUC": round(float(auc), 4) if np.isfinite(auc) else np.nan
+                    })
+
+            if not results:
+                st.warning("No valid weight combinations (check grids).")
+            else:
+                res_df = pd.DataFrame(results).sort_values(
+                    by=["Hits@20", "NDCG@30", "AUC"], ascending=[False, False, False]
+                ).reset_index(drop=True)
+
+                st.subheader("🔎 Weight Search Results (sorted by Hits@20 → NDCG@30 → AUC)")
+                st.dataframe(res_df, use_container_width=True)
+
+                best = res_df.iloc[0]
+                st.success(
+                    f"Best weights: w_prob={best['w_prob']}, w_overlay={best['w_overlay']}, w_ranker={best['w_ranker']} "
+                    f"| Hits@20={best['Hits@20']} • NDCG@30={best['NDCG@30']} • AUC={best['AUC']}"
+                )
+
+                # Recompute final score using the best weights
+                wp, wo, wr = float(best["w_prob"]), float(best["w_overlay"]), float(best["w_ranker"])
+                tuned_score = expit(wp * logit_p + wo * log_overlay + wr * ranker_z)
+
+                # Build a tuned leaderboard preview
+                tuned_leaderboard = today_df.copy()
+                tuned_leaderboard["ranked_probability"] = tuned_score
+                tuned_leaderboard["hr_probability_iso_T"] = p_base
+                tuned_leaderboard = tuned_leaderboard.sort_values("ranked_probability", ascending=False).reset_index(drop=True)
+
+                st.markdown("### 🏆 Tuned Leaderboard Preview (Top 30)")
+                st.dataframe(
+                    tuned_leaderboard[[
+                        c for c in ["player_name", "team_code", "time",
+                                    "hr_probability_iso_T", "overlay_multiplier",
+                                    "weak_pitcher_factor", "final_multiplier", "ranked_probability",
+                                    "hr_outcome"] if c in tuned_leaderboard.columns
+                    ]].head(30).round(3),
+                    use_container_width=True
+                )
+
+                st.download_button(
+                    "⬇️ Download Full Tuned Leaderboard CSV",
+                    data=tuned_leaderboard.to_csv(index=False),
+                    file_name="today_hr_predictions_tuned.csv"
+                )
     # ---- Build leaderboard (rank by blended score) ----
     def build_leaderboard(df, calibrated_probs, final_score, label="calibrated_hr_probability"):
         df = df.copy()
