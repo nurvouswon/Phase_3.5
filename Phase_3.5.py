@@ -888,6 +888,26 @@ if event_file is not None and today_file is not None:
 
     w_prob, w_overlay, w_ranker = 0.6, 0.2, 0.2
     score = expit(w_prob * logit_p + w_overlay * log_overlay + w_ranker * ranker_z)
+    # --- Ground-truth HR labels for Aug 9 (unique hitters, includes Jo Adell) ---
+    hr_hitters_aug9 = {
+        "Junior Caminero","Ernie Clement","Julio Rodríguez","Cal Raleigh","Shohei Ohtani","Max Muncy",
+        "Brandon Lowe","Corbin Carroll","Corey Seager","William Contreras","Brice Turang","Starling Marte",
+        "Brent Rooker","Michael Busch","Taylor Ward","Michael A. Taylor","Pete Alonso","Gunnar Henderson",
+        "Jo Adell","Paul DeJong","Josh Bell","Trent Grisham","James Wood","Michael Harris II","Jeremy Peña",
+        "Brenton Doyle","Luis Rengifo"
+    }
+
+    # Normalize a few name variants seen in feeds
+    today_df["player_name"] = today_df["player_name"].astype(str)
+    today_df["player_name"] = (
+        today_df["player_name"]
+          .str.replace(r"^Peter Alonso$", "Pete Alonso", regex=True)
+          .str.replace(r"^Jeremy Pena$", "Jeremy Peña", regex=True)
+          .str.replace(r"^Julio Rodriguez$", "Julio Rodríguez", regex=True)
+    )
+
+    # Create/overwrite hr_outcome from the set (1 if in set else 0)
+    today_df["hr_outcome"] = today_df["player_name"].isin(hr_hitters_aug9).astype(int)
     # ===================== BLEND TUNER =====================
     st.markdown("## 🔧 Blend Tuner")
     if "hr_outcome" not in today_df.columns:
