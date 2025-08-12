@@ -962,51 +962,17 @@ if event_file is not None and today_file is not None:
     dis_z = zscore(disagree_std)
     dis_penalty = np.clip(dis_z, 0, 3)  # only penalize above-average disagreement
 
-    # ==== Lightweight consensus upgrades (no new features/cols required) ====
+    # --- Bayesian shrink of p_base based on base-model disagreement (safe, always on) ---
+    # reuse the base learner probs we already computed for dis_penalty
+    model_std = np.std(np.vstack([p_xgb, p_lgb, p_cat]), axis=0).astype(np.float32)
 
-        # 1) Disagreement across base models (std of probs) → Bayesian shrink of p_base
-        px = np.mean(P_xgb_today, axis=0)  # shape: [n_today]
-        pl = np.mean(P_lgb_today, axis=0)
-        pc = np.mean(P_cat_today, axis=0)
-        stack_probs = np.vstack([px, pl, pc])  # [3, n_today]
-        model_std = np.std(stack_probs, axis=0).astype(np.float32)  # disagreement per player
+    # map std → shrink weight alpha in [0, 0.40]
+    s0, s1 = 0.02, 0.08   # std ≤ 0.02 → no shrink; std ≥ 0.08 → max shrink
+    alpha = np.clip((model_std - s0) / max(1e-9, (s1 - s0)), 0.0, 1.0) * 0.40
+    base_rate = float(np.clip(y.mean() if len(y) else 0.03, 1e-6, 1-1e-6))
 
-        # map std → shrink weight alpha in [0, 0.40]
-        # std ≤ 0.02 → no shrink; std ≥ 0.08 → max shrink
-        s0, s1 = 0.02, 0.08
-        alpha = np.clip((model_std - s0) / max(1e-9, (s1 - s0)), 0.0, 1.0) * 0.40
-        base_rate = float(np.clip(y.mean() if len(y) else 0.03, 1e-6, 1-1e-6))  # safety
-        p_base_shrunk = (1.0 - alpha) * np.clip(p_base, 1e-6, 1-1e-6) + alpha * base_rate
-
-        # replace p_base & its logit with shrunk version
-        p_base = p_base_shrunk
-        logit_p = logit(np.clip(p_base, 1e-6, 1-1e-6))
-
-        # 2) Reciprocal Rank Fusion (consensus rank-only nudge) from base models + ranker
-        n = p_base.shape[0]
-        # ranks: 1 = best; ties use 'average'
-        r_px = pd.Series(-px).rank(method="average").to_numpy(dtype=np.float32)
-        r_pl = pd.Series(-pl).rank(method="average").to_numpy(dtype=np.float32)
-        r_pc = pd.Series(-pc).rank(method="average").to_numpy(dtype=np.float32)
-        # convert ranker_z to a rank as well (higher is better → lower rank)
-        r_rk = pd.Series(-ranker_z).rank(method="average").to_numpy(dtype=np.float32)
-
-        k = 50.0  # softens tail contribution
-        rrf = (1.0/(k + r_px) + 1.0/(k + r_pl) + 1.0/(k + r_pc) + 1.0/(k + r_rk)).astype(np.float32)
-        rrf_z = (rrf - rrf.mean()) / (rrf.std() + 1e-9)  # z-score
-
-        # 3) Stability penalty: penalize extreme disagreement (very small, bounded)
-        std_z = (model_std - model_std.mean()) / (model_std.std() + 1e-9)
-        std_pen = np.clip(std_z, -3.0, 3.0)  # keep it tame
-
-        # ---- Updated final blend (tiny weights for new terms, safe) ----
-        w_prob, w_overlay, w_ranker = 0.60, 0.20, 0.18   # shave 0.02 off ranker to make room
-        w_rrf  = 0.04                                     # small consensus boost
-        lam_pen = 0.06                                    # tiny penalty on uncertainty
-
-        # blend in logit-space; subtract stability penalty
-        blend_logit = (w_prob * logit_p) + (w_overlay * log_overlay) + (w_ranker * ranker_z) + (w_rrf * rrf_z) - (lam_pen * std_pen)
-        score = expit(blend_logit)
+    p_base = (1.0 - alpha) * np.clip(p_base, 1e-6, 1-1e-6) + alpha * base_rate
+    logit_p = logit(np.clip(p_base, 1e-6, 1-1e-6))
     # ---- Blended final score: prob + overlay + ranker + rrf - penalty ----
     w_prob, w_overlay, w_ranker, w_rrf, w_penalty = 0.56, 0.18, 0.18, 0.08, 0.15
     logit_blend = (w_prob * logit_p
