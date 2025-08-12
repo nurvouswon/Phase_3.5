@@ -1057,109 +1057,59 @@ else:
         else:
             st.warning("No valid weight combinations. Using current score as-is.")
 
-# ============================================================
-# =============== Leaderboard Build & Outputs ================
-# ============================================================
-def build_leaderboard(df, calibrated_probs, final_score, label="calibrated_hr_probability"):
-    df = df.copy()
-    df[label] = np.asarray(calibrated_probs)
-    df["ranked_probability"] = np.asarray(final_score)
+    # Build leaderboard after (optional) tuning
+    leaderboard = build_leaderboard(today_df, p_base, score, label="hr_probability_iso_T")
 
-    # Sort by blended score and keep a base-rank from calibrated prob
-    df = df.sort_values("ranked_probability", ascending=False).reset_index(drop=True)
-    df["hr_base_rank"] = df[label].rank(method="min", ascending=False)
+    # ===== Render current-day leaderboard =====
+    top_n = st.sidebar.number_input("Top-N to display", min_value=10, max_value=100, value=30, step=5)
+    st.markdown(f"### 🏆 **Top {top_n} HR Leaderboard (Blended + Overlays + Ranker)**")
+    leaderboard_top = leaderboard.head(int(top_n))
+    st.dataframe(leaderboard_top, use_container_width=True)
 
-    # Columns to show
-    cols = []
-    for c in ["player_name", "team_code", "time"]:
-        if c in df.columns:
-            cols.append(c)
+    st.download_button(
+        label=f"⬇️ Download Top {int(top_n)} Leaderboard CSV",
+        data=leaderboard_top.to_csv(index=False),
+        file_name=f"top{int(top_n)}_leaderboard_blended.csv",
+        mime="text/csv",
+    )
 
-    cols += [
-        label, "ranked_probability",
-        # Overlays
-        "overlay_multiplier", "weak_pitcher_factor", "final_multiplier",
-        # Weather/context
-        "temp", "temp_rating", "humidity", "humidity_rating",
-        "wind_mph", "wind_rating", "wind_dir_string",
-        "condition", "condition_rating",
-        # Optional eval label if present
-        "hr_outcome",
-    ]
-    cols = [c for c in cols if c in df.columns]
-    out = df[cols].copy()
+    st.download_button(
+        label="⬇️ Download Full Prediction CSV (Blended)",
+        data=leaderboard.to_csv(index=False),
+        file_name="today_hr_predictions_full_blended.csv",
+        mime="text/csv",
+    )
 
-    # Nice rounding
-    if label in out.columns:
-        out[label] = out[label].round(4)
-    if "ranked_probability" in out.columns:
-        out["ranked_probability"] = out["ranked_probability"].round(4)
-    for c in ["overlay_multiplier", "weak_pitcher_factor", "final_multiplier"]:
-        if c in out.columns:
-            out[c] = out[c].astype(float).round(3)
+    # Leaderboard bar chart (Top-N)
+    if {"player_name", "ranked_probability"}.issubset(leaderboard_top.columns) and not leaderboard_top.empty:
+        st.subheader(f"📊 Ranked Probability Distribution (Top {int(top_n)})")
+        fig, ax = plt.subplots(figsize=(10, 7))
+        ax.barh(leaderboard_top["player_name"].astype(str), leaderboard_top["ranked_probability"])
+        ax.invert_yaxis()
+        ax.set_xlabel("Ranked HR Score (probability scale)")
+        ax.set_ylabel("Player")
+        st.pyplot(fig)
+        plt.close(fig)
 
-    return out
+    # Drift diagnostics (safe)
+    try:
+        drifted = drift_check(X, X_today, n=6)
+        if drifted:
+            st.markdown("#### ⚡ **Feature Drift Diagnostics**")
+            st.write("These features show unusual mean/std changes:", drifted)
+    except Exception:
+        pass
 
-# ===== Render current-day leaderboard =====
-top_n = st.sidebar.number_input("Top-N to display", min_value=10, max_value=100, value=30, step=5)
-st.markdown(f"### 🏆 **Top {top_n} HR Leaderboard (Blended + Overlays + Ranker)**")
-leaderboard_top = leaderboard.head(int(top_n))
-st.dataframe(leaderboard_top, use_container_width=True)
+    # Prediction histogram (all)
+    if "ranked_probability" in leaderboard.columns and not leaderboard.empty:
+        st.subheader("Prediction Probability Distribution (all predictions, Blended)")
+        plt.figure(figsize=(8, 3))
+        plt.hist(leaderboard["ranked_probability"], bins=30, alpha=0.7)
+        plt.xlabel("Ranked HR Probability")
+        plt.ylabel("Count")
+        st.pyplot(plt.gcf())
+        plt.close()
 
-st.download_button(
-    label=f"⬇️ Download Top {int(top_n)} Leaderboard CSV",
-    data=leaderboard_top.to_csv(index=False),
-    file_name=f"top{int(top_n)}_leaderboard_blended.csv",
-    mime="text/csv",
-)
-
-st.download_button(
-    label="⬇️ Download Full Prediction CSV (Blended)",
-    data=leaderboard.to_csv(index=False),
-    file_name="today_hr_predictions_full_blended.csv",
-    mime="text/csv",
-)
-
-# Leaderboard bar chart (Top-N)
-if {"player_name", "ranked_probability"}.issubset(leaderboard_top.columns):
-    st.subheader(f"📊 Ranked Probability Distribution (Top {int(top_n)})")
-    fig, ax = plt.subplots(figsize=(10, 7))
-    ax.barh(leaderboard_top["player_name"].astype(str), leaderboard_top["ranked_probability"])
-    ax.invert_yaxis()
-    ax.set_xlabel("Ranked HR Score (probability scale)")
-    ax.set_ylabel("Player")
-    st.pyplot(fig)
-    plt.close(fig)
-
-# Drift diagnostics (safe)
-try:
-    drifted = drift_check(X, X_today, n=6)
-    if drifted:
-        st.markdown("#### ⚡ **Feature Drift Diagnostics**")
-        st.write(
-            "These features have unusual mean/std changes between training and today; "
-            "verify if input context shifted:",
-            drifted,
-        )
-except Exception:
-    pass
-
-# Prediction histogram (all)
-if "ranked_probability" in leaderboard.columns:
-    st.subheader("Prediction Probability Distribution (all predictions, Blended)")
-    plt.figure(figsize=(8, 3))
-    plt.hist(leaderboard["ranked_probability"], bins=30, alpha=0.7)
-    plt.xlabel("Ranked HR Probability")
-    plt.ylabel("Count")
-    st.pyplot(plt.gcf())
-    plt.close()
-
-# ============ Final cleanup ============
-try:
-    del leaderboard_top
-except Exception:
-    pass
-
-gc.collect()
-st.success("✅ HR Prediction pipeline complete. Leaderboard generated and ready.")
-st.caption("Meta-ensemble + calibrated probs + contextual overlays + (optional) online learning ranker.")
+    gc.collect()
+    st.success("✅ HR Prediction pipeline complete. Leaderboard generated and ready.")
+    st.caption("Meta-ensemble + calibrated probs + contextual overlays + (optional) online learning ranker.")
