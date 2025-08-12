@@ -1,10 +1,24 @@
+# app.py
+# ============================================================
+# 🏆 MLB Home Run Predictor — "Max Power" Edition
+# - Robust feature pruning & pinning
+# - Target encoding with time-embargoed OOF
+# - Tree ensemble (XGB/LGB/CB) + meta stacker (LR)
+# - Isotonic calibration + top-K temperature tuning
+# - Context overlays (weather + weak/slumping pitcher)
+# - Short-term hot-streak signal (3–5 games)
+# - Day-wise ranker head (LambdaRank)
+# - Blend Tuner (grid) with safe fallbacks
+# - Daily logging + learning ranker retrain + optional apply
+# - Safe even if no hr_outcome or no learning_ranker yet
+# ============================================================
+
 import streamlit as st
 import pandas as pd
 import numpy as np
-import gc
-import time
-import psutil
-from datetime import timedelta
+import gc, time, psutil, pickle
+from io import BytesIO
+from datetime import timedelta, date
 from collections import defaultdict
 
 from sklearn.metrics import roc_auc_score, log_loss
@@ -19,13 +33,14 @@ import lightgbm as lgb
 import catboost as cb
 
 import matplotlib.pyplot as plt
+# (SHAP is optional; we only run it when user asks. OK to import.)
 import shap
 
 from scipy.special import logit, expit
 
 # ===================== UI =====================
-st.set_page_config(page_title="🏆 MLB Home Run Predictor — State of the Art, Phase 1", layout="wide")
-st.title("🏆 MLB Home Run Predictor — State of the Art, Phase 1")
+st.set_page_config(page_title="🏆 MLB Home Run Predictor — Max Power", layout="wide")
+st.title("🏆 MLB Home Run Predictor — Max Power")
 
 # ===================== Helpers / Utilities =====================
 @st.cache_data(show_spinner=False, max_entries=2)
@@ -49,18 +64,28 @@ def fix_types(df):
         if df[col].isnull().all():
             continue
         if df[col].dtype == 'O':
+            # keep strings we need later; everything else try numeric
             try:
                 df[col] = pd.to_numeric(df[col], errors='ignore')
             except Exception:
                 pass
-        if pd.api.types.is_float_dtype(df[col]) and (df[col].dropna() % 1 == 0).all():
-            df[col] = df[col].astype(pd.Int64Dtype())
+        if pd.api.types.is_float_dtype(df[col]):
+            # if float but all values are whole numbers -> cast to Int64
+            try:
+                s = df[col].dropna()
+                if len(s) and (s % 1 == 0).all():
+                    df[col] = df[col].astype(pd.Int64Dtype())
+            except Exception:
+                pass
     return df
 
 def clean_X(df, train_cols=None):
     df = dedup_columns(df)
     df = fix_types(df)
-    allowed_obj = {'wind_dir_string','condition','player_name','city','park','roof_status','team_code','time','batter_hand','pitcher_team_code','pitcher_hand','stand'}
+    allowed_obj = {
+        'wind_dir_string','condition','player_name','city','park','roof_status',
+        'team_code','time','batter_hand','pitcher_team_code','pitcher_hand','stand'
+    }
     drop_cols = [c for c in df.select_dtypes('O').columns if c not in allowed_obj]
     df = df.drop(columns=drop_cols, errors='ignore')
     df = df.fillna(-1)
@@ -72,7 +97,8 @@ def clean_X(df, train_cols=None):
     return df
 
 def get_valid_feature_cols(df, drop=None):
-    base_drop = set(['game_date','batter_id','player_name','pitcher_id','city','park','roof_status','team_code','time'])
+    base_drop = set(['game_date','batter_id','player_name','pitcher_id','city','park',
+                     'roof_status','team_code','time'])
     if drop: base_drop = base_drop.union(drop)
     numerics = df.select_dtypes(include=[np.number]).columns
     return [c for c in numerics if c not in base_drop]
@@ -94,24 +120,14 @@ def feature_debug(X):
     st.write("🛡️ Feature Debugging:")
     st.write("Data types:", X.dtypes.value_counts())
     object_cols = X.select_dtypes(include="object").columns.tolist()
-    if object_cols:
-        st.write("Columns with object dtype:", object_cols)
-    else:
-        st.write("Columns with object dtype: []")
-    for col in X.columns:
-        try:
-            if X[col].dtype not in [np.float64, np.float32, np.int64, np.int32]:
-                st.write(f"Column `{col}` is {X[col].dtype}, unique values: {X[col].unique()[:8]}")
-        except Exception as e:
-            st.write(f"⚠️ Could not inspect column `{col}`: {e}")
+    st.write("Columns with object dtype:", object_cols if object_cols else [])
     st.write("Missing values per column (top 10):", X.isna().sum().sort_values(ascending=False).head(10))
 
 def drift_check(train, today, n=5):
     drifted = []
     for c in train.columns:
         if c not in today.columns: continue
-        tmean = np.nanmean(train[c])
-        tstd = np.nanstd(train[c])
+        tmean = np.nanmean(train[c]); tstd = np.nanstd(train[c])
         dmean = np.nanmean(today[c])
         if tstd > 0 and abs(tmean - dmean) / tstd > n:
             drifted.append(c)
@@ -127,7 +143,7 @@ def winsorize_clip(X, limits=(0.01, 0.99)):
 
 def remove_outliers(
     X, y, method="iforest", contamination=0.012,
-    n_estimators=100, max_samples='auto', n_neighbors=20, scale=True
+    n_estimators=150, max_samples='auto', n_neighbors=20, scale=True
 ):
     if scale:
         scaler = StandardScaler()
@@ -232,7 +248,7 @@ def tune_temperature_for_topk(p_oof, y, K=20, T_grid=np.linspace(0.8, 1.6, 17)):
             best_hits, best_T = hits, float(T)
     return best_T
 
-# ===================== Overlay & Weather (UPGRADED) =====================
+# ===================== Overlays & Ratings =====================
 def _getv(row, keys, default=np.nan):
     for k in keys:
         if k in row and pd.notnull(row[k]):
@@ -250,6 +266,7 @@ def _first_present(row, base, windows):
     return np.nan
 
 def overlay_multiplier(row):
+    # Tight range; we’ll combine with weak_pitcher and hot-streak later
     EDGE_MIN, EDGE_MAX = 0.68, 1.44
     PULL_HI, PULL_LO   = 0.35, 0.28
     FB_HI_P, FB_HI_B   = 0.25, 0.22
@@ -257,7 +274,6 @@ def overlay_multiplier(row):
     HOT_HR_HI, HOT_HR_LO = 0.09, 0.025
 
     edge = 1.0
-
     b_hand = _hand(row, True)
     p_hand = _hand(row, False)
 
@@ -361,6 +377,7 @@ def overlay_multiplier(row):
         else:
             edge *= 0.985
 
+    # tiny handedness nudge
     if b_hand != p_hand: edge *= 1.01
     else: edge *= 0.995
 
@@ -458,6 +475,30 @@ def weak_pitcher_factor(row):
 
     return float(np.clip(factor, 0.90, 1.15))
 
+# -------- Short-term hot streak (3–5 games) factor (low-leak proxy) --------
+def short_term_hot_factor(row):
+    """
+    Looks for any of these recent windows and builds a gentle multiplier:
+    - exit velo (e.g., b_avg_exit_velo_5, _3)
+    - launch angle centrality/consistency (b_la_mean_5, b_la_sd_5)
+    - barrel rate (b_barrel_rate_5, _3)
+    If not present, returns 1.0
+    """
+    ev = _first_non_null(row, "b_avg_exit_velo_5", "b_avg_exit_velo_3", default=np.nan)
+    la = _first_non_null(row, "b_la_mean_5", "b_la_mean_3", default=np.nan)
+    br = _first_non_null(row, "b_barrel_rate_5", "b_barrel_rate_3", default=np.nan)
+    # mild, conservative adjustments
+    factor = 1.0
+    try:
+        if pd.notnull(ev) and float(ev) >= 91: factor *= 1.03
+        if pd.notnull(la) and 12 <= float(la) <= 24: factor *= 1.02
+        if pd.notnull(br):
+            if float(br) >= 0.12: factor *= 1.05
+            elif float(br) >= 0.08: factor *= 1.02
+    except Exception:
+        pass
+    return float(np.clip(factor, 0.96, 1.10))
+
 # ===================== APP START =====================
 event_file = st.file_uploader("Upload Event-Level CSV/Parquet for Training (required)", type=['csv', 'parquet'], key='eventcsv')
 today_file = st.file_uploader("Upload TODAY CSV for Prediction (required)", type=['csv', 'parquet'], key='todaycsv')
@@ -517,11 +558,11 @@ if event_file is not None and today_file is not None:
     feature_debug(X)
 
     # ---- Prune: NaN heavy, near-constant, dup-correlated ----
-    nan_thresh = 0.3
+    nan_thresh = 0.30
     nan_pct = X.isna().mean()
     drop_cols = nan_pct[nan_pct > nan_thresh].index.tolist()
     if drop_cols:
-        st.warning(f"Dropping {len(drop_cols)} features with >30% NaNs: {drop_cols[:20]}")
+        st.warning(f"Dropping {len(drop_cols)} features with >30% NaNs (showing up to 20): {drop_cols[:20]}")
         X = X.drop(columns=drop_cols)
         X_today = X_today.drop(columns=drop_cols, errors='ignore')
 
@@ -542,7 +583,7 @@ if event_file is not None and today_file is not None:
     X = winsorize_clip(X)
     X_today = winsorize_clip(X_today)
 
-    # --- Optional: polynomial crosses (OFF by default) ---
+    # --- Optional: polynomial crosses (OFF by default; safe for Cloud)
     use_crosses = st.checkbox("Enable polynomial interaction crosses (slow, memory heavy)", value=False)
     if use_crosses:
         try:
@@ -556,6 +597,7 @@ if event_file is not None and today_file is not None:
             keep_cross = list(var_scores.head(min(300, max(50, X_cross.shape[1]//10))).index)
             X_cross = X_cross[keep_cross]
             X = pd.concat([X, X_cross], axis=1)
+
             Xt_today = X_today.astype(np.float32)
             X_today_cross = pd.DataFrame(poly.transform(Xt_today), columns=poly.get_feature_names_out(X_today.columns))
             X_today_cross = X_today_cross[keep_cross]
@@ -657,7 +699,7 @@ if event_file is not None and today_file is not None:
     if set(["pitcher_team_code","batter_hand"]).issubset(cats_full.columns):
         te_specs.append(("te_pteam_hand", _combo(cats_full["pitcher_team_code"], cats_full["batter_hand"])))
 
-    n_splits = 5
+    n_splits = st.slider("Number of time-embargoed CV splits", 4, 7, 5, 1)
     folds = embargo_time_splits(dates_aligned, n_splits=n_splits, embargo_days=1)
 
     te_maps = {}
@@ -685,9 +727,10 @@ if event_file is not None and today_file is not None:
                                                      te_maps.get("te_pteam_hand", {}), global_means.get("te_pteam_hand", y.mean()))
 
     # Fill learnable wind-to-pull flag for today (train was 0.0 to avoid leakage)
-    if "wind_dir_string" in today_df.columns and "stand" in today_df.columns:
+    if "wind_dir_string" in today_df.columns and ("stand" in today_df.columns or "batter_hand" in today_df.columns):
         wdir = today_df["wind_dir_string"].astype(str).str.lower().fillna("")
-        hand = today_df["stand"].astype(str).str.upper().fillna("R")
+        hand_src = "stand" if "stand" in today_df.columns else "batter_hand"
+        hand = today_df[hand_src].astype(str).str.upper().fillna("R")
         pulled_field = np.where(hand == "R", "lf", "rf")
         out_to_pull = wdir.str.contains("out") & (
             ((pulled_field == "lf") & wdir.str.contains("lf")) |
@@ -708,18 +751,10 @@ if event_file is not None and today_file is not None:
     X_today = X_today.fillna(-1)
     nan_inf_check(X_today, "X_today (pinned)")
     st.write(f"✅ Columns pinned. Train cols: {X.shape[1]} | Today cols: {X_today.shape[1]}")
-
-    # --- Debug view ---
-    feature_debug(X_today)
-    st.dataframe(X_today.head(500))
-    st.write(f"✅ Final training matrix: {X.shape}")
-    st.write("🎯 Feature engineering complete.")
+    st.dataframe(X_today.head(300))
 
     # ========== Train/Validation via Embargoed Time Splits ==========
-    pos = float(y.sum())
-    neg = float(len(y) - pos)
-
-    seeds = [42, 101, 777]
+    seeds = [42, 101]  # trimmed for speed on Cloud; increase locally
     P_xgb_oof = np.zeros(len(y), dtype=np.float32)
     P_lgb_oof = np.zeros(len(y), dtype=np.float32)
     P_cat_oof = np.zeros(len(y), dtype=np.float32)
@@ -740,8 +775,8 @@ if event_file is not None and today_file is not None:
 
         for sd in seeds:
             xgb_clf = xgb.XGBClassifier(
-                n_estimators=600, max_depth=6, learning_rate=0.03,
-                subsample=0.8, colsample_bytree=0.8, reg_lambda=2.0,
+                n_estimators=650, max_depth=6, learning_rate=0.03,
+                subsample=0.85, colsample_bytree=0.85, reg_lambda=2.0,
                 eval_metric="logloss", tree_method="hist",
                 scale_pos_weight=spw_fold, early_stopping_rounds=50,
                 n_jobs=1, verbosity=0, random_state=sd
@@ -758,7 +793,7 @@ if event_file is not None and today_file is not None:
                 verbose=0, thread_count=1, random_seed=sd
             )
 
-            xgb_clf.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
+            xgb_clf.fit(X_tr, y_tr_s, eval_set=[(X_va, y_va)], verbose=False)
             lgb_clf.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], callbacks=[lgb.early_stopping(50), lgb.log_evaluation(0)])
             cat_clf.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
 
@@ -794,7 +829,7 @@ if event_file is not None and today_file is not None:
         est_time_left = avg_time * (len(folds) - (fold + 1))
         st.write(f"Fold {fold + 1}/{len(folds)} finished in {timedelta(seconds=int(fold_time))}. Est. {timedelta(seconds=int(est_time_left))} left.")
 
-    # ---------- LGBMRanker head ----------
+    # ---------- Day-wise LGBMRanker head ----------
     days = pd.to_datetime(dates_aligned).dt.floor("D")
     ranker_oof = np.zeros(len(y), dtype=np.float32)
     ranker_today_parts = []
@@ -821,7 +856,7 @@ if event_file is not None and today_file is not None:
 
     ranker_today = np.mean(ranker_today_parts, axis=0)
 
-    # Stack with meta LR
+    # ---------- Meta stacker ----------
     X_meta = np.column_stack([P_xgb_oof, P_lgb_oof, P_cat_oof]).astype(np.float32)
     scaler_meta = StandardScaler()
     X_meta_s = scaler_meta.fit_transform(X_meta)
@@ -835,290 +870,296 @@ if event_file is not None and today_file is not None:
     ]).astype(np.float32)
     P_today_meta = meta.predict_proba(scaler_meta.transform(P_today_base))[:,1]
 
-    # OOF performance of meta
+    # ---------- Calibration ----------
+    st.markdown("### 📊 Calibration (Isotonic on OOF meta)")
     oof_pred_meta = meta.predict_proba(X_meta_s)[:,1]
     auc_oof = roc_auc_score(y, oof_pred_meta)
     ll_oof  = log_loss(y, oof_pred_meta)
     st.success(f"OOF Meta AUC: {auc_oof:.4f} | OOF Meta LogLoss: {ll_oof:.4f}")
 
-    # ===== Calibration on OOF only =====
-    st.markdown("### 📊 Calibration (Isotonic on OOF meta)")
     ir = IsotonicRegression(out_of_bounds="clip")
     y_oof_iso = ir.fit_transform(oof_pred_meta, y.values)
     today_iso = ir.transform(P_today_meta)
 
-    # ---- Temperature tuning for Top-K ----
     best_T = tune_temperature_for_topk(y_oof_iso, y.values, K=20, T_grid=np.linspace(0.8, 1.6, 17))
     logits_today = logit(np.clip(today_iso, 1e-6, 1-1e-6))
     today_iso_t = expit(logits_today * best_T)
 
-    # ---- ADD WEATHER RATINGS & OVERLAY ----
+    # ---------- Apply overlays ----------
     today_df = today_df.copy()
     ratings_df = today_df.apply(rate_weather, axis=1)
     for col in ratings_df.columns:
         today_df[col] = ratings_df[col]
 
     today_df["overlay_multiplier"] = today_df.apply(overlay_multiplier, axis=1)
-
-    # ---- Weak pitcher factor & final multiplier ----
     today_df["weak_pitcher_factor"] = today_df.apply(weak_pitcher_factor, axis=1).astype(np.float32)
+    today_df["hot_streak_factor"]   = today_df.apply(short_term_hot_factor, axis=1).astype(np.float32)
+
+    # Final multiplier = weather/park * weak pitcher * short-term hot-streak (clamped)
     today_df["final_multiplier"] = (
         today_df["overlay_multiplier"].astype(float).clip(0.68, 1.44)
         * today_df["weak_pitcher_factor"].astype(float)
+        * today_df["hot_streak_factor"].astype(float)
     ).clip(0.60, 1.65).astype(np.float32)
 
+    # ========= USE LEARNING RANKER IF PROVIDED =========
+    lr_file = st.file_uploader("Optional: upload learning_ranker.pkl to apply learned ordering", type=["pkl"], key="lrpk")
+    learned_rank_score = None
+    if lr_file is not None:
+        try:
+            bundle = pickle.load(lr_file)
+            lbr = bundle["model"]
+            rk_feats = bundle["features"]
+            feat_map = {
+                "base_prob":   np.asarray(today_iso_t, dtype=float),
+                "logit_p":     logit(np.clip(today_iso_t, 1e-6, 1 - 1e-6)),
+                "log_overlay": np.log(today_df["final_multiplier"].values + 1e-9),
+                "ranker_z":    zscore(ranker_today),
+                "overlay_multiplier": today_df.get("overlay_multiplier", pd.Series(1.0, index=today_df.index)).to_numpy(dtype=float),
+                "final_multiplier":   today_df.get("final_multiplier",   pd.Series(1.0, index=today_df.index)).to_numpy(dtype=float),
+            }
+            Xrk_today = np.column_stack([feat_map[f] for f in rk_feats if f in feat_map]).astype(np.float32)
+            learned_rank_score = lbr.predict(Xrk_today)
+            st.info("Applied learning ranker. Replacing original ranker_z for blending.")
+            ranker_z = zscore(learned_rank_score)
+        except Exception as e:
+            st.warning(f"Could not load/apply learning ranker: {e}")
+            ranker_z = zscore(ranker_today)
+    else:
+        ranker_z = zscore(ranker_today)
+
     # ---- Blended final score: prob + overlay + ranker ----
-    # p_base is the calibrated probability stream. Prefer temp-tuned isotonic; fall back safely.
+    # p_base prefers temp-tuned isotonic; safe fallback
     try:
         p_base = today_iso_t
     except NameError:
         try:
             p_base = today_iso
         except NameError:
-            p_base = P_today_meta  # raw meta prob as last resort
+            p_base = P_today_meta
 
     logit_p = logit(np.clip(p_base, 1e-6, 1 - 1e-6))
     log_overlay = np.log(today_df["final_multiplier"].values + 1e-9)
 
-    # If you trained the day-wise ranker earlier, we use it; otherwise fall back safely.
-    try:
-        ranker_z = zscore(ranker_today)
-    except NameError:
-        ranker_z = np.zeros_like(p_base, dtype=np.float32)
-
     w_prob, w_overlay, w_ranker = 0.6, 0.2, 0.2
     score = expit(w_prob * logit_p + w_overlay * log_overlay + w_ranker * ranker_z)
-    # --- Ground-truth HR labels for Aug 9 (unique hitters, includes Jo Adell) ---
-    hr_hitters_aug9 = {
-        "Junior Caminero","Ernie Clement","Julio Rodríguez","Cal Raleigh","Shohei Ohtani","Max Muncy",
-        "Brandon Lowe","Corbin Carroll","Corey Seager","William Contreras","Brice Turang","Starling Marte",
-        "Brent Rooker","Michael Busch","Taylor Ward","Michael A. Taylor","Pete Alonso","Gunnar Henderson",
-        "Jo Adell","Paul DeJong","Josh Bell","Trent Grisham","James Wood","Michael Harris II","Jeremy Peña",
-        "Brenton Doyle","Luis Rengifo"
-    }
 
-    # Normalize a few name variants seen in feeds
-    today_df["player_name"] = today_df["player_name"].astype(str)
-    today_df["player_name"] = (
-        today_df["player_name"]
-          .str.replace(r"^Peter Alonso$", "Pete Alonso", regex=True)
-          .str.replace(r"^Jeremy Pena$", "Jeremy Peña", regex=True)
-          .str.replace(r"^Julio Rodriguez$", "Julio Rodríguez", regex=True)
-    )
+    # ========== (Optional) Auto-fill Aug 9 HR labels for quick tuning demo ==========
+    with st.expander("🔧 (Optional) Auto-fill known HR labels for 2025-08-09 demo"):
+        use_aug9 = st.checkbox("Fill hr_outcome from built-in Aug 9 list (won't overwrite your file)", value=False)
+        if use_aug9:
+            hr_hitters_aug9 = {
+                "Junior Caminero","Ernie Clement","Julio Rodríguez","Cal Raleigh","Shohei Ohtani","Max Muncy",
+                "Brandon Lowe","Corbin Carroll","Corey Seager","William Contreras","Brice Turang","Starling Marte",
+                "Brent Rooker","Michael Busch","Taylor Ward","Michael A. Taylor","Pete Alonso","Gunnar Henderson",
+                "Jo Adell","Paul DeJong","Josh Bell","Trent Grisham","James Wood","Michael Harris II","Jeremy Peña",
+                "Brenton Doyle","Luis Rengifo"
+            }
+            today_df["player_name"] = today_df["player_name"].astype(str)
+            today_df["player_name"] = (
+                today_df["player_name"]
+                  .str.replace(r"^Peter Alonso$", "Pete Alonso", regex=True)
+                  .str.replace(r"^Jeremy Pena$", "Jeremy Peña", regex=True)
+                  .str.replace(r"^Julio Rodriguez$", "Julio Rodríguez", regex=True)
+            )
+            today_df["hr_outcome"] = today_df["player_name"].isin(hr_hitters_aug9).astype(int)
+            st.success("Filled hr_outcome for the demo day.")
 
-    # Create/overwrite hr_outcome from the set (1 if in set else 0)
-    today_df["hr_outcome"] = today_df["player_name"].isin(hr_hitters_aug9).astype(int)
-    # ===================== BLEND TUNER =====================
-    st.markdown("## 🔧 Blend Tuner")
-    if "hr_outcome" not in today_df.columns:
-        st.info("To use the Blend Tuner, your TODAY file must include a column named **hr_outcome** (1 if the batter homered, 0 otherwise). Tuner skipped.")
+    # ============================================================
+# ===================== BLEND TUNER ==========================
+# ============================================================
+st.markdown("## 🔧 Blend Tuner")
+if "hr_outcome" not in today_df.columns:
+    st.info("To use the Blend Tuner, your TODAY file must include **hr_outcome** (1 = HR, 0 = no HR).")
+else:
+    y_true = today_df["hr_outcome"].fillna(0).astype(int).to_numpy()
+    if y_true.sum() == 0 or y_true.sum() == len(y_true):
+        st.warning("Blend Tuner needs a mix of 0s and 1s in hr_outcome. Tuner skipped.")
     else:
-        y_true = today_df["hr_outcome"].fillna(0).astype(int).to_numpy()
-        if y_true.sum() == 0 or y_true.sum() == len(y_true):
-            st.warning("Blend Tuner needs both 0s and 1s in hr_outcome. Tuner skipped.")
+        # Helpers
+        def score_with_weights(wp, wo, wr, a_logit, b_logoverlay, c_ranker):
+            return expit(wp * a_logit + wo * b_logoverlay + wr * c_ranker)
+
+        def hits_at_k(y, s, K):
+            order = np.argsort(-s)
+            return int(np.sum(y[order][:K]))
+
+        def dcg_at_k(rels, K):
+            rels = np.asarray(rels)[:K]
+            if rels.size == 0:
+                return 0.0
+            discounts = 1.0 / np.log2(np.arange(2, 2 + len(rels)))
+            return float(np.sum(rels * discounts))
+
+        def ndcg_at_k(y, s, K):
+            order = np.argsort(-s)
+            rel_sorted = y[order]
+            dcg = dcg_at_k(rel_sorted, K)
+            ideal = np.sort(y)[::-1]
+            idcg = dcg_at_k(ideal, K)
+            return (dcg / idcg) if idcg > 0 else 0.0
+
+        # Use the ranker signal you already computed (z-scored)
+        try:
+            _ranker = ranker_z
+        except NameError:
+            _ranker = np.zeros_like(logit_p, dtype=np.float32)
+
+        # Grid of weights
+        prob_grid    = [0.40, 0.50, 0.60, 0.70]
+        overlay_grid = [0.10, 0.20, 0.25, 0.30]
+        ranker_min   = 0.05
+
+        results = []
+        for wp in prob_grid:
+            for wo in overlay_grid:
+                wr = 1.0 - wp - wo
+                if wr < ranker_min:
+                    continue
+                s = score_with_weights(wp, wo, wr, logit_p, log_overlay, _ranker)
+                h10 = hits_at_k(y_true, s, 10)
+                h20 = hits_at_k(y_true, s, 20)
+                h30 = hits_at_k(y_true, s, 30)
+                ndcg30 = ndcg_at_k(y_true, s, 30)
+                try:
+                    auc = roc_auc_score(y_true, s)
+                except Exception:
+                    auc = np.nan
+                results.append({
+                    "w_prob": round(wp, 2),
+                    "w_overlay": round(wo, 2),
+                    "w_ranker": round(wr, 2),
+                    "Hits@10": h10,
+                    "Hits@20": h20,
+                    "Hits@30": h30,
+                    "NDCG@30": round(ndcg30, 4),
+                    "AUC": round(float(auc), 4) if np.isfinite(auc) else np.nan
+                })
+
+        if results:
+            res_df = pd.DataFrame(results).sort_values(
+                by=["Hits@20", "NDCG@30", "AUC"], ascending=[False, False, False]
+            ).reset_index(drop=True)
+
+            st.subheader("🔎 Weight Search Results (sorted by Hits@20 → NDCG@30 → AUC)")
+            st.dataframe(res_df, use_container_width=True)
+
+            best = res_df.iloc[0]
+            st.success(
+                f"Best weights: w_prob={best['w_prob']}, w_overlay={best['w_overlay']}, w_ranker={best['w_ranker']} "
+                f"| Hits@20={best['Hits@20']} • NDCG@30={best['NDCG@30']} • AUC={best['AUC']}"
+            )
+
+            # Recompute final score using the best weights
+            wp, wo, wr = float(best["w_prob"]), float(best["w_overlay"]), float(best["w_ranker"])
+            tuned_score = expit(wp * logit_p + wo * log_overlay + wr * _ranker)
+            score = tuned_score  # use tuned score for the final leaderboard below
         else:
-            # Helpers
-            def score_with_weights(wp, wo, wr, a_logit, b_logoverlay, c_ranker):
-                z = wp * a_logit + wo * b_logoverlay + wr * c_ranker
-                return expit(z)
+            st.warning("No valid weight combinations. Using current score as-is.")
 
-            def hits_at_k(y, s, K):
-                order = np.argsort(-s)
-                return int(np.sum(y[order][:K]))
+# ============================================================
+# =============== Leaderboard Build & Outputs ================
+# ============================================================
+def build_leaderboard(df, calibrated_probs, final_score, label="calibrated_hr_probability"):
+    df = df.copy()
+    df[label] = np.asarray(calibrated_probs)
+    df["ranked_probability"] = np.asarray(final_score)
 
-            def dcg_at_k(rels, K):
-                rels = np.asarray(rels)[:K]
-                if rels.size == 0:
-                    return 0.0
-                discounts = 1.0 / np.log2(np.arange(2, 2 + len(rels)))
-                return float(np.sum(rels * discounts))
+    # Sort by blended score and keep a base-rank from calibrated prob
+    df = df.sort_values("ranked_probability", ascending=False).reset_index(drop=True)
+    df["hr_base_rank"] = df[label].rank(method="min", ascending=False)
 
-            def ndcg_at_k(y, s, K):
-                order = np.argsort(-s)
-                rel_sorted = y[order]
-                dcg = dcg_at_k(rel_sorted, K)
-                ideal = np.sort(y)[::-1]
-                idcg = dcg_at_k(ideal, K)
-                return (dcg / idcg) if idcg > 0 else 0.0
+    # Columns to show
+    cols = []
+    for c in ["player_name", "team_code", "time"]:
+        if c in df.columns:
+            cols.append(c)
 
-            # Grid of weights (we normalize to sum to 1)
-            prob_grid    = [0.40, 0.50, 0.60, 0.70]
-            overlay_grid = [0.10, 0.20, 0.25, 0.30]
-            ranker_min   = 0.05
+    cols += [
+        label, "ranked_probability",
+        # Overlays
+        "overlay_multiplier", "weak_pitcher_factor", "final_multiplier",
+        # Weather/context
+        "temp", "temp_rating", "humidity", "humidity_rating",
+        "wind_mph", "wind_rating", "wind_dir_string",
+        "condition", "condition_rating",
+        # Optional eval label if present
+        "hr_outcome",
+    ]
+    cols = [c for c in cols if c in df.columns]
+    out = df[cols].copy()
 
-            results = []
-            for wp in prob_grid:
-                for wo in overlay_grid:
-                    wr = 1.0 - wp - wo
-                    if wr < ranker_min:
-                        continue
-                    # Compute blended score
-                    s = score_with_weights(wp, wo, wr, logit_p, log_overlay, ranker_z)
+    # Nice rounding
+    if label in out.columns:
+        out[label] = out[label].round(4)
+    if "ranked_probability" in out.columns:
+        out["ranked_probability"] = out["ranked_probability"].round(4)
+    for c in ["overlay_multiplier", "weak_pitcher_factor", "final_multiplier"]:
+        if c in out.columns:
+            out[c] = out[c].astype(float).round(3)
 
-                    # Metrics
-                    h10 = hits_at_k(y_true, s, 10)
-                    h20 = hits_at_k(y_true, s, 20)
-                    h30 = hits_at_k(y_true, s, 30)
-                    ndcg30 = ndcg_at_k(y_true, s, 30)
-                    try:
-                        auc = roc_auc_score(y_true, s)
-                    except Exception:
-                        auc = np.nan
+    return out
 
-                    results.append({
-                        "w_prob": round(wp, 2),
-                        "w_overlay": round(wo, 2),
-                        "w_ranker": round(wr, 2),
-                        "Hits@10": h10,
-                        "Hits@20": h20,
-                        "Hits@30": h30,
-                        "NDCG@30": round(ndcg30, 4),
-                        "AUC": round(float(auc), 4) if np.isfinite(auc) else np.nan
-                    })
+# ===== Render current-day leaderboard =====
+top_n = st.sidebar.number_input("Top-N to display", min_value=10, max_value=100, value=30, step=5)
+st.markdown(f"### 🏆 **Top {top_n} HR Leaderboard (Blended + Overlays + Ranker)**")
+leaderboard_top = leaderboard.head(int(top_n))
+st.dataframe(leaderboard_top, use_container_width=True)
 
-            if not results:
-                st.warning("No valid weight combinations (check grids).")
-            else:
-                res_df = pd.DataFrame(results).sort_values(
-                    by=["Hits@20", "NDCG@30", "AUC"], ascending=[False, False, False]
-                ).reset_index(drop=True)
+st.download_button(
+    label=f"⬇️ Download Top {int(top_n)} Leaderboard CSV",
+    data=leaderboard_top.to_csv(index=False),
+    file_name=f"top{int(top_n)}_leaderboard_blended.csv",
+    mime="text/csv",
+)
 
-                st.subheader("🔎 Weight Search Results (sorted by Hits@20 → NDCG@30 → AUC)")
-                st.dataframe(res_df, use_container_width=True)
+st.download_button(
+    label="⬇️ Download Full Prediction CSV (Blended)",
+    data=leaderboard.to_csv(index=False),
+    file_name="today_hr_predictions_full_blended.csv",
+    mime="text/csv",
+)
 
-                best = res_df.iloc[0]
-                st.success(
-                    f"Best weights: w_prob={best['w_prob']}, w_overlay={best['w_overlay']}, w_ranker={best['w_ranker']} "
-                    f"| Hits@20={best['Hits@20']} • NDCG@30={best['NDCG@30']} • AUC={best['AUC']}"
-                )
+# Leaderboard bar chart (Top-N)
+if {"player_name", "ranked_probability"}.issubset(leaderboard_top.columns):
+    st.subheader(f"📊 Ranked Probability Distribution (Top {int(top_n)})")
+    fig, ax = plt.subplots(figsize=(10, 7))
+    ax.barh(leaderboard_top["player_name"].astype(str), leaderboard_top["ranked_probability"])
+    ax.invert_yaxis()
+    ax.set_xlabel("Ranked HR Score (probability scale)")
+    ax.set_ylabel("Player")
+    st.pyplot(fig)
+    plt.close(fig)
 
-                # Recompute final score using the best weights
-                wp, wo, wr = float(best["w_prob"]), float(best["w_overlay"]), float(best["w_ranker"])
-                tuned_score = expit(wp * logit_p + wo * log_overlay + wr * ranker_z)
+# Drift diagnostics (safe)
+try:
+    drifted = drift_check(X, X_today, n=6)
+    if drifted:
+        st.markdown("#### ⚡ **Feature Drift Diagnostics**")
+        st.write(
+            "These features have unusual mean/std changes between training and today; "
+            "verify if input context shifted:",
+            drifted,
+        )
+except Exception:
+    pass
 
-                # Build a tuned leaderboard preview
-                tuned_leaderboard = today_df.copy()
-                tuned_leaderboard["ranked_probability"] = tuned_score
-                tuned_leaderboard["hr_probability_iso_T"] = p_base
-                tuned_leaderboard = tuned_leaderboard.sort_values("ranked_probability", ascending=False).reset_index(drop=True)
+# Prediction histogram (all)
+if "ranked_probability" in leaderboard.columns:
+    st.subheader("Prediction Probability Distribution (all predictions, Blended)")
+    plt.figure(figsize=(8, 3))
+    plt.hist(leaderboard["ranked_probability"], bins=30, alpha=0.7)
+    plt.xlabel("Ranked HR Probability")
+    plt.ylabel("Count")
+    st.pyplot(plt.gcf())
+    plt.close()
 
-                st.markdown("### 🏆 Tuned Leaderboard Preview (Top 30)")
-                st.dataframe(
-                    tuned_leaderboard[[
-                        c for c in ["player_name", "team_code", "time",
-                                    "hr_probability_iso_T", "overlay_multiplier",
-                                    "weak_pitcher_factor", "final_multiplier", "ranked_probability",
-                                    "hr_outcome"] if c in tuned_leaderboard.columns
-                    ]].head(30).round(3),
-                    use_container_width=True
-                )
+# ============ Final cleanup ============
+try:
+    del leaderboard_top
+except Exception:
+    pass
 
-                st.download_button(
-                    "⬇️ Download Full Tuned Leaderboard CSV",
-                    data=tuned_leaderboard.to_csv(index=False),
-                    file_name="today_hr_predictions_tuned.csv"
-                )
-    # ---- Build leaderboard (rank by blended score) ----
-    def build_leaderboard(df, calibrated_probs, final_score, label="calibrated_hr_probability"):
-        df = df.copy()
-        df[label] = np.asarray(calibrated_probs)
-        df["ranked_probability"] = np.asarray(final_score)
-
-        # Sort and basic ranking
-        df = df.sort_values("ranked_probability", ascending=False).reset_index(drop=True)
-        df["hr_base_rank"] = df[label].rank(method="min", ascending=False)
-
-        # Columns to show
-        leaderboard_cols = []
-        for c in ["player_name", "team_code", "time"]:
-            if c in df.columns:
-                leaderboard_cols.append(c)
-
-        leaderboard_cols += [
-            label, "ranked_probability",
-            # Overlays
-            "overlay_multiplier", "weak_pitcher_factor", "final_multiplier",
-            # Weather context
-            "temp", "temp_rating",
-            "humidity", "humidity_rating",
-            "wind_mph", "wind_rating",
-            "wind_dir_string", "condition", "condition_rating",
-        ]
-
-        # Keep only those that exist
-        leaderboard_cols = [c for c in leaderboard_cols if c in df.columns]
-        leaderboard = df[leaderboard_cols].copy()
-
-        # Nicely rounded views
-        if label in leaderboard.columns:
-            leaderboard[label] = leaderboard[label].round(4)
-        if "ranked_probability" in leaderboard.columns:
-            leaderboard["ranked_probability"] = leaderboard["ranked_probability"].round(4)
-        for c in ["overlay_multiplier", "weak_pitcher_factor", "final_multiplier"]:
-            if c in leaderboard.columns:
-                leaderboard[c] = leaderboard[c].astype(float).round(3)
-
-        return leaderboard
-
-    leaderboard = build_leaderboard(today_df, p_base, score, "hr_probability_iso_T")
-
-    # ===== Outputs =====
-    top_n = 30
-    st.markdown(f"### 🏆 **Top {top_n} HR Leaderboard (Meta + Isotonic + Temp + Ranker + Weather & Weak-Pitcher Overlay)**")
-    leaderboard_top = leaderboard.head(top_n)
-    st.dataframe(leaderboard_top, use_container_width=True)
-
-    st.download_button(
-        f"⬇️ Download Top {top_n} Leaderboard CSV",
-        data=leaderboard_top.to_csv(index=False),
-        file_name=f"top{top_n}_leaderboard_blended.csv"
-    )
-
-    st.download_button(
-        "⬇️ Download Full Prediction CSV (Blended)",
-        data=leaderboard.to_csv(index=False),
-        file_name="today_hr_predictions_full_blended.csv"
-    )
-
-    # Leaderboard plot
-    if "player_name" in leaderboard_top.columns and "ranked_probability" in leaderboard_top.columns:
-        st.subheader(f"📊 Ranked Probability Distribution (Top {top_n})")
-        fig, ax = plt.subplots(figsize=(10, 7))
-        ax.barh(leaderboard_top["player_name"].astype(str), leaderboard_top["ranked_probability"])
-        ax.invert_yaxis()
-        ax.set_xlabel('Ranked HR Score (probability scale)')
-        ax.set_ylabel('Player')
-        st.pyplot(fig)
-        plt.close(fig)
-
-    # Drift diagnostics
-    try:
-        drifted = drift_check(X, X_today, n=6)
-        if drifted:
-            st.markdown("#### ⚡ **Feature Drift Diagnostics**")
-            st.write("These features have unusual mean/std changes between training and today, check if input context shifted:", drifted)
-    except Exception:
-        pass
-
-    # Prediction histogram
-    if "ranked_probability" in leaderboard.columns:
-        st.subheader("Prediction Probability Distribution (all predictions, Blended)")
-        plt.figure(figsize=(8, 3))
-        plt.hist(leaderboard["ranked_probability"], bins=30, alpha=0.7)
-        plt.xlabel("Ranked HR Probability")
-        plt.ylabel("Count")
-        st.pyplot(plt.gcf())
-        plt.close()
-
-    # Memory cleanup
-    try:
-        del X, X_today, y
-    except Exception:
-        pass
-    for varname in ["P_xgb_oof", "P_lgb_oof", "P_cat_oof", "P_xgb_today", "P_lgb_today", "P_cat_today"]:
-        if varname in globals():
-            try:
-                del globals()[varname]
-            except Exception:
-                pass
-    gc.collect()
+gc.collect()
+st.success("✅ HR Prediction pipeline complete. Leaderboard generated and ready.")
+st.caption("Meta-ensemble + calibrated probs + contextual overlays + (optional) online learning ranker.")
