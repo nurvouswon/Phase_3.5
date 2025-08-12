@@ -964,7 +964,7 @@ if event_file is not None and today_file is not None:
 
     # --- Bayesian shrink of p_base based on base-model disagreement (safe, always on) ---
     # reuse the base learner probs we already computed for dis_penalty
-    model_std = np.std(np.vstack([p_xgb, p_lgb, p_cat]), axis=0).astype(np.float32)
+    model_std = disagree_std.astype(np.float32)
 
     # map std → shrink weight alpha in [0, 0.40]
     s0, s1 = 0.02, 0.08   # std ≤ 0.02 → no shrink; std ≥ 0.08 → max shrink
