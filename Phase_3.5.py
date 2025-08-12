@@ -779,7 +779,7 @@ if event_file is not None and today_file is not None:
                 verbose=0, thread_count=1, random_seed=sd
             )
 
-            xgb_clf.fit(X_tr, y_tr_s, eval_set=[(X_va, y_va)], verbose=False)
+            xgb_clf.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
             lgb_clf.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], callbacks=[lgb.early_stopping(50), lgb.log_evaluation(0)])
             cat_clf.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
 
