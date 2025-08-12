@@ -961,8 +961,8 @@ if event_file is not None and today_file is not None:
     disagree_std = np.std(np.vstack([p_xgb, p_lgb, p_cat]), axis=0)
     dis_z = zscore(disagree_std)
     dis_penalty = np.clip(dis_z, 0, 3)  # only penalize above-average disagreement
-# ==== Lightweight consensus upgrades (no new features/cols required) ====
-# ==== Lightweight consensus upgrades (no new features/cols required) ====
+
+    # ==== Lightweight consensus upgrades (no new features/cols required) ====
 
         # 1) Disagreement across base models (std of probs) → Bayesian shrink of p_base
         px = np.mean(P_xgb_today, axis=0)  # shape: [n_today]
