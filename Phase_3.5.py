@@ -1092,16 +1092,16 @@ if event_file is not None and today_file is not None:
                     - best["w_penalty"] * dis_penalty
                 )
             else:
-    st.warning("No valid weight combinations. Using current score as-is.")
-    st.write("Weights in use:",
-             {"w_prob": w_prob, "w_overlay": w_overlay, "w_ranker": w_ranker,
-              "w_rrf": w_rrf, "w_penalty": w_penalty})
-    if "hr_outcome" in today_df.columns:
-        top30_idx = np.argsort(-score)[:30]
-        hits_top30 = int(today_df.loc[top30_idx, "hr_outcome"].fillna(0).astype(int).sum())
-        st.success(f"Hits in Top-30: {hits_top30}/30")
-    else:
-        st.info("No hr_outcome in TODAY; tuner skipped, using default weights.")
+                st.warning("No valid weight combinations. Using current score as-is.")
+                st.write("Weights in use:",
+                         {"w_prob": w_prob, "w_overlay": w_overlay, "w_ranker": w_ranker,
+                          "w_rrf": w_rrf, "w_penalty": w_penalty})
+                if "hr_outcome" in today_df.columns:
+                    top30_idx = np.argsort(-score)[:30]
+                    hits_top30 = int(today_df.loc[top30_idx, "hr_outcome"].fillna(0).astype(int).sum())
+                    st.success(f"Hits in Top-30: {hits_top30}/30")
+                else:
+                    st.info("No hr_outcome in TODAY; tuner skipped, using default weights.")
     # ================= Leaderboard Build & Outputs =================
     def build_leaderboard(df, calibrated_probs, final_score, label="calibrated_hr_probability"):
         df = df.copy()
