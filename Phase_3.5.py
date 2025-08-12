@@ -974,7 +974,7 @@ if event_file is not None and today_file is not None:
     p_base = (1.0 - alpha) * np.clip(p_base, 1e-6, 1-1e-6) + alpha * base_rate
     logit_p = logit(np.clip(p_base, 1e-6, 1-1e-6))
     # ---- Blended final score: prob + overlay + ranker + rrf - penalty ----
-    w_prob, w_overlay, w_ranker, w_rrf, w_penalty = 0.56, 0.18, 0.18, 0.08, 0.15
+    w_prob, w_overlay, w_ranker, w_rrf, w_penalty = 0.50, 0.22, 0.05, 0.10, 0.20
     logit_blend = (w_prob * logit_p
                    + w_overlay * log_overlay
                    + w_ranker * ranker_z
