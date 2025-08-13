@@ -740,7 +740,7 @@ if event_file is not None and today_file is not None:
     st.dataframe(X_today.head(300))
 
     # ========== Train/Validation via Embargoed Time Splits ==========
-    seeds = [42, 101]  # extend locally if you want more bags
+    seeds = [42, 101, 202, 404]  # a few extra bags to steady p_base and reduce disagreement noise
     P_xgb_oof = np.zeros(len(y), dtype=np.float32)
     P_lgb_oof = np.zeros(len(y), dtype=np.float32)
     P_cat_oof = np.zeros(len(y), dtype=np.float32)
@@ -1151,7 +1151,41 @@ if event_file is not None and today_file is not None:
     today_df["model_disagreement"] = disagree_std
 
     leaderboard = build_leaderboard(today_df, p_base, score, label="hr_probability_iso_T")
+    # ---- Bootstrap CI for Hits@K on current slate (diagnostic only)
+    with st.expander("📏 Hits@K — bootstrap confidence intervals"):
+        if "hr_outcome" in today_df.columns:
+            y_true_boot = today_df["hr_outcome"].fillna(0).astype(int).to_numpy()
+            if y_true_boot.sum() == 0 or y_true_boot.sum() == len(y_true_boot):
+                st.info("Need mixed labels (0/1) to compute Hits@K CIs.")
+            else:
+                def _hits_at_k(y, s, K):
+                    order = np.argsort(-s)
+                    return int(np.sum(y[order][:K]))
 
+            # fixed score from current best weights
+                s_fixed = np.asarray(score, dtype=float)
+                n = len(s_fixed)
+                B = 300  # number of bootstrap resamples
+                Ks = [10, 20, 30]
+                boot = {k: [] for k in Ks}
+
+                rng = np.random.default_rng(123)
+                for _ in range(B):
+                    idx = rng.integers(0, n, size=n)  # sample with replacement indices
+                    y_b = y_true_boot[idx]
+                    s_b = s_fixed[idx]
+                    for K in Ks:
+                        boot[K].append(_hits_at_k(y_b, s_b, K))
+
+                ci_rows = []
+                for K in Ks:
+                    arr = np.array(boot[K], dtype=float)
+                    mean = arr.mean()
+                    lo, hi = np.percentile(arr, [5, 95])  # 90% CI
+                    ci_rows.append({"K": K, "Mean Hits", "90% CI Low", "90% CI High"})
+                st.dataframe(pd.DataFrame(ci_rows), use_container_width=True)
+        else:
+            st.info("No hr_outcome in TODAY; bootstrap CIs require labels.")
     # ===== Render current-day leaderboard =====
     top_n = st.sidebar.number_input("Top-N to display", min_value=10, max_value=100, value=30, step=5)
     st.markdown(f"### 🏆 **Top {top_n} HR Leaderboard (Blended + Overlays + Ranker)**")
