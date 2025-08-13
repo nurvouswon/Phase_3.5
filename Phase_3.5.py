@@ -987,11 +987,12 @@ if event_file is not None and today_file is not None:
         use_aug9 = st.checkbox("Fill hr_outcome from built-in Aug 9 list (won't overwrite your file)", value=False)
         if use_aug9:
             hr_hitters_aug9 = {
-                "Junior Caminero","Ernie Clement","Julio Rodríguez","Cal Raleigh","Shohei Ohtani","Max Muncy",
-                "Brandon Lowe","Corbin Carroll","Corey Seager","William Contreras","Brice Turang","Starling Marte",
-                "Brent Rooker","Michael Busch","Taylor Ward","Michael A. Taylor","Pete Alonso","Gunnar Henderson",
-                "Jo Adell","Paul DeJong","Josh Bell","Trent Grisham","James Wood","Michael Harris II","Jeremy Peña",
-                "Brenton Doyle","Luis Rengifo"
+                "Junior Caminero", "Ernie Clement", "Julio Rodríguez", "Cal Raleigh", "Shohei Ohtani", "Max Muncy",
+                "Brandon Lowe", "Corbin Carroll", "Corey Seager", "William Contreras", "Xander Bogaerts", "Matt Shaw",
+                "C.J. Kayfus", "Marcell Ozuna", "Juan Soto", "Brice Turang", "Starling Marte", "Brent Rooker", "Michael Busch",
+                "Taylor Ward", "Michael A. Taylor", "Pete Alonso", "Gunnar Henderson", "Jo Adell", "Shea Langeliers",
+                "Rafael Devers", "Paul DeJong", "Josh Bell", "Trent Grisham", "James Wood", "Michael Harris II", "Jeremy Peña",
+                "Brenton Doyle", "Luis Rengifo"
             }
             today_df["player_name"] = today_df["player_name"].astype(str)
             today_df["player_name"] = (
