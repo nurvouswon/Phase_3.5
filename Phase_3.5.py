@@ -311,6 +311,11 @@ def overlay_multiplier(row):
     p_fb = _first_present(row, "p_fb_rate", [14,7,5])
 
     roof_closed = ("closed" in roof) or ("indoor" in roof) or ("domed" in roof)
+    # Synergy: if pitcher is fly-ball leaning and weather is favorable, nudge up a bit
+    p_fb = _first_present(row, "p_fb_rate", [14,7,5])
+    if pd.notnull(p_fb) and float(p_fb) >= 0.40:
+        if (pd.notnull(temp) and temp >= 75) and (pd.notnull(wind) and wind >= 7 and "out" in wind_dir) and not roof_closed:
+            edge *= 1.02  # small, controlled nudge
     if pd.notnull(altitude):
         if altitude >= 5000: edge *= 1.05
         elif altitude >= 3000: edge *= 1.02
