@@ -983,26 +983,32 @@ if event_file is not None and today_file is not None:
     score = expit(logit_blend)
 
     # ========== (Optional) Auto-fill Aug 9 HR labels for quick tuning demo ==========
-    with st.expander("🔧 (Optional) Auto-fill known HR labels for 2025-08-09 demo"):
-        use_aug9 = st.checkbox("Fill hr_outcome from built-in Aug 9 list (won't overwrite your file)", value=False)
-        if use_aug9:
-            hr_hitters_aug9 = {
-                "Junior Caminero", "Ernie Clement", "Julio Rodríguez", "Cal Raleigh", "Shohei Ohtani", "Max Muncy",
-                "Brandon Lowe", "Corbin Carroll", "Corey Seager", "William Contreras", "Xander Bogaerts", "Matt Shaw",
-                "C.J. Kayfus", "Marcell Ozuna", "Juan Soto", "Brice Turang", "Starling Marte", "Brent Rooker", "Michael Busch",
-                "Taylor Ward", "Michael A. Taylor", "Pete Alonso", "Gunnar Henderson", "Jo Adell", "Shea Langeliers",
-                "Rafael Devers", "Paul DeJong", "Josh Bell", "Trent Grisham", "James Wood", "Michael Harris II", "Jeremy Peña",
-                "Brenton Doyle", "Luis Rengifo"
-            }
-            today_df["player_name"] = today_df["player_name"].astype(str)
-            today_df["player_name"] = (
-                today_df["player_name"]
-                  .str.replace(r"^Peter Alonso$", "Pete Alonso", regex=True)
-                  .str.replace(r"^Jeremy Pena$", "Jeremy Peña", regex=True)
-                  .str.replace(r"^Julio Rodriguez$", "Julio Rodríguez", regex=True)
-            )
-            today_df["hr_outcome"] = today_df["player_name"].isin(hr_hitters_aug9).astype(int)
-            st.success("Filled hr_outcome for the demo day.")
+    # ---- Ground truth HR hitters for 2025-08-09 (demo) ----
+    hr_hitters_aug9 = {
+        "Junior Caminero","Ernie Clement","Julio Rodríguez","Cal Raleigh","Shohei Ohtani","Max Muncy",
+        "Brandon Lowe","Corbin Carroll","Corey Seager","William Contreras","Xander Bogaerts","Matt Shaw",
+        "C.J. Kayfus","Marcell Ozuna","Luis Rengifo","Brenton Doyle","Juan Soto","Brice Turang",
+        "Starling Marte","Brent Rooker","Michael Busch","Taylor Ward","Michael A. Taylor","Pete Alonso",
+        "Gunnar Henderson","Jo Adell","Shea Langeliers","Rafael Devers","Paul DeJong","Josh Bell",
+        "Trent Grisham","James Wood","Michael Harris II","Jeremy Peña"
+    }
+
+    # Normalize TODAY names then fix common variants to ensure matches
+    today_df["player_name"] = today_df["player_name"].astype(str).str.strip()
+
+    _name_fixes = {
+        r"^Peter Alonso$": "Pete Alonso",
+        r"^Jeremy Pena$": "Jeremy Peña",
+        r"^Julio Rodriguez$": "Julio Rodríguez",
+        r"^Michael A Taylor$": "Michael A. Taylor",
+        r"^CJ Kayfus$": "C.J. Kayfus",
+        r"^C\. J\. Kayfus$": "C.J. Kayfus",
+    }
+    for pat, rep in _name_fixes.items():
+        today_df["player_name"] = today_df["player_name"].str.replace(pat, rep, regex=True)
+
+    # Apply labels for the demo day (replace or create hr_outcome)
+    today_df["hr_outcome"] = today_df["player_name"].isin(hr_hitters_aug9).astype(int)
 
     # ============================================================
     # ===================== BLEND TUNER ==========================
