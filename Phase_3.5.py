@@ -1026,14 +1026,8 @@ if event_file is not None and today_file is not None:
     p_base = (1.0 - alpha) * np.clip(p_base, 1e-6, 1-1e-6) + alpha * base_rate
     logit_p = logit(np.clip(p_base, 1e-6, 1-1e-6))
 
-    # ---- Blended final score: prob + overlay + ranker + RRF - penalty ----
-    w_prob, w_overlay, w_ranker, w_rrf, w_penalty = 0.50, 0.22, 0.05, 0.10, 0.20
-    logit_blend = (w_prob * logit_p
-                   + w_overlay * log_overlay
-                   + w_ranker * ranker_z
-                   + w_rrf * rrf_z
-                   - w_penalty * dis_penalty)
-    score = expit(logit_blend)
+    # Final blended score using tuner or saved weights
+    score = _blend_score(use_weights, logit_p, log_overlay, ranker_z, rrf_z, dis_penalty)
 
     # ========== (Optional) Auto-fill Aug 9 HR labels for quick tuning demo ==========
     hr_hitters_aug9 = {
@@ -1060,97 +1054,119 @@ if event_file is not None and today_file is not None:
     # ============================================================
     # ===================== POWER BLEND TUNER ====================
     # ============================================================
-    st.markdown("## 🔧 Power Blend Tuner (Wide Search)")
-    if "hr_outcome" not in today_df.columns:
-        st.info("To use the Blend Tuner, your TODAY file must include **hr_outcome** (1 = HR, 0 = no HR).")
-    else:
+    st.markdown("## 🔧 Power Blend Tuner")
+
+    # Initialize persistent weights in session_state, seeded from your global DEFAULT_WEIGHTS
+    if "saved_best_weights" not in st.session_state:
+        st.session_state.saved_best_weights = DEFAULT_WEIGHTS.copy()
+
+    run_tuner = st.toggle("Run Blend Tuner (random search)", value=False, key="run_blend_tuner")
+
+    # Helper to combine components using weights
+    def _blend_score(w, a_logit, b_logoverlay, c_ranker, d_rrf, e_pen):
+        return expit(
+            w["w_prob"]    * a_logit
+          + w["w_overlay"] * b_logoverlay
+          + w["w_ranker"]  * c_ranker
+          + w["w_rrf"]     * d_rrf
+          - w["w_penalty"] * e_pen
+        )
+
+    # Always start from the currently saved best weights (your locked-in best)
+    use_weights = st.session_state.saved_best_weights.copy()
+
+    # If tuner is ON and labels exist, try to improve weights
+    if run_tuner and "hr_outcome" in today_df.columns:
         y_true = today_df["hr_outcome"].fillna(0).astype(int).to_numpy()
         if y_true.sum() == 0 or y_true.sum() == len(y_true):
-            st.warning("Blend Tuner needs a mix of 0s and 1s in hr_outcome. Tuner skipped.")
+            st.warning("Blend Tuner needs a mix of 0s and 1s in hr_outcome. Using saved best weights.")
         else:
-            def score_with_weights(wp, wo, wr, wrrf, wpen,
-                                   a_logit, b_logoverlay, c_ranker, d_rrf, e_pen):
-                return expit(wp*a_logit + wo*b_logoverlay + wr*c_ranker + wrrf*d_rrf - wpen*e_pen)
-
-            def hits_at_k(y, s, K):
+            # --- metrics helpers
+            def _hits_at_k(y, s, K):
                 order = np.argsort(-s)
                 return int(np.sum(y[order][:K]))
 
-            def dcg_at_k(rels, K):
+            def _dcg_at_k(rels, K):
                 rels = np.asarray(rels)[:K]
                 if rels.size == 0:
                     return 0.0
                 discounts = 1.0 / np.log2(np.arange(2, 2 + len(rels)))
                 return float(np.sum(rels * discounts))
 
-            def ndcg_at_k(y, s, K):
+            def _ndcg_at_k(y, s, K):
                 order = np.argsort(-s)
                 rel_sorted = y[order]
-                dcg = dcg_at_k(rel_sorted, K)
+                dcg = _dcg_at_k(rel_sorted, K)
                 ideal = np.sort(y)[::-1]
-                idcg = dcg_at_k(ideal, K)
+                idcg = _dcg_at_k(ideal, K)
                 return (dcg / idcg) if idcg > 0 else 0.0
 
-            num_samples = 10000
+            # --- random search over simplex (weights sum to 1)
             rng = np.random.default_rng(42)
+            num_samples = 10000  # keep this at 10k; runs fast and finds strong blends
 
-            results = []
+            best_tuple = None
+            best_row = None
             for _ in range(int(num_samples)):
-                wp, wo, wr, wrrf, wpen = rng.dirichlet(np.ones(5))
-                s = score_with_weights(wp, wo, wr, wrrf, wpen,
-                                       logit_p, log_overlay, ranker_z, rrf_z, dis_penalty)
-                h10 = hits_at_k(y_true, s, 10)
-                h20 = hits_at_k(y_true, s, 20)
-                h30 = hits_at_k(y_true, s, 30)
-                ndcg30 = ndcg_at_k(y_true, s, 30)
-                try:
-                    auc = roc_auc_score(y_true, s)
-                except Exception:
-                    auc = np.nan
-                results.append({
-                    "w_prob": round(wp, 3),
-                    "w_overlay": round(wo, 3),
-                    "w_ranker": round(wr, 3),
-                    "w_rrf": round(wrrf, 3),
-                    "w_penalty": round(wpen, 3),
-                    "Hits@10": h10,
-                    "Hits@20": h20,
-                    "Hits@30": h30,
-                    "NDCG@30": round(ndcg30, 4),
-                    "AUC": round(float(auc), 4) if np.isfinite(auc) else np.nan
-                })
+                wv = rng.dirichlet(np.ones(5))
+                cand = {
+                    "w_prob": float(wv[0]),
+                    "w_overlay": float(wv[1]),
+                    "w_ranker": float(wv[2]),
+                    "w_rrf": float(wv[3]),
+                    "w_penalty": float(wv[4]),
+                }
+                s = _blend_score(cand, logit_p, log_overlay, ranker_z, rrf_z, dis_penalty)
+                h10 = _hits_at_k(y_true, s, 10)
+                h20 = _hits_at_k(y_true, s, 20)
+                h30 = _hits_at_k(y_true, s, 30)
+                ndcg30 = _ndcg_at_k(y_true, s, 30)
+                # Primary → secondary → tertiary sort key
+                key = (h20, ndcg30, h30)
 
-            if results:
-                res_df = pd.DataFrame(results).sort_values(
-                    by=["Hits@20", "NDCG@30", "AUC"], ascending=[False, False, False]
-                ).reset_index(drop=True)
+                if (best_tuple is None) or (key > best_tuple):
+                    best_tuple = key
+                    best_row = {
+                        **cand,
+                        "Hits@10": h10,
+                        "Hits@20": h20,
+                        "Hits@30": h30,
+                        "NDCG@30": float(round(ndcg30, 4)),
+                    }
 
-                st.subheader("🔎 Weight Search Results (sorted by Hits@20 → NDCG@30 → AUC)")
-                st.dataframe(res_df.head(50), use_container_width=True)
+            # If we found an improvement, persist it
+            if best_row is not None:
+                st.session_state.saved_best_weights = {
+                    "w_prob": best_row["w_prob"],
+                    "w_overlay": best_row["w_overlay"],
+                    "w_ranker": best_row["w_ranker"],
+                    "w_rrf": best_row["w_rrf"],
+                    "w_penalty": best_row["w_penalty"],
+                }
+                use_weights = st.session_state.saved_best_weights.copy()
 
-                best = res_df.iloc[0]
                 st.success(
-                    f"Best weights: w_prob={best['w_prob']}, w_overlay={best['w_overlay']}, "
-                    f"w_ranker={best['w_ranker']}, w_rrf={best['w_rrf']}, w_penalty={best['w_penalty']} | "
-                    f"Hits@20={best['Hits@20']} • NDCG@30={best['NDCG@30']} • AUC={best['AUC']}"
+                    f"New best weights → "
+                    f"w_prob={use_weights['w_prob']:.3f}, "
+                    f"w_overlay={use_weights['w_overlay']:.3f}, "
+                    f"w_ranker={use_weights['w_ranker']:.3f}, "
+                    f"w_rrf={use_weights['w_rrf']:.3f}, "
+                    f"w_penalty={use_weights['w_penalty']:.3f} | "
+                    f"Hits@20={best_row['Hits@20']} • Hits@10={best_row['Hits@10']} • NDCG@30={best_row['NDCG@30']}"
                 )
-                score = expit(
-                    best["w_prob"] * logit_p
-                    + best["w_overlay"] * log_overlay
-                    + best["w_ranker"] * ranker_z
-                    + best["w_rrf"] * rrf_z
-                    - best["w_penalty"] * dis_penalty
-                )
-            else:
-                st.warning("No valid weight combinations. Using current score as-is.")
-                st.write("Weights in use:",
-                         {"w_prob": w_prob, "w_overlay": w_overlay, "w_ranker": w_ranker,
-                          "w_rrf": w_rrf, "w_penalty": w_penalty})
-                if "hr_outcome" in today_df.columns:
-                    top30_idx = np.argsort(-score)[:30]
-                    hits_top30 = int(today_df.loc[top30_idx, "hr_outcome"].fillna(0).astype(int).sum())
-                    st.success(f"Hits in Top-30 (current weights): {hits_top30}/30")
+    else:
+        # Tuner OFF → we’ll just show and use your locked best weights
+        st.info(
+            "Blend Tuner is skipped. Using saved weights: "
+            f"w_prob={use_weights['w_prob']:.3f}, "
+            f"w_overlay={use_weights['w_overlay']:.3f}, "
+            f"w_ranker={use_weights['w_ranker']:.3f}, "
+            f"w_rrf={use_weights['w_rrf']:.3f}, "
+            f"w_penalty={use_weights['w_penalty']:.3f}"
+        )
 
+    # ---- Final blended score using chosen weights (tuned or saved)
+    score = _blend_score(use_weights, logit_p, log_overlay, ranker_z, rrf_z, dis_penalty)
     # ================= Leaderboard Build & Outputs =================
     def build_leaderboard(df, calibrated_probs, final_score, label="calibrated_hr_probability"):
         df = df.copy()
