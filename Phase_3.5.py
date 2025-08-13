@@ -37,7 +37,14 @@ import matplotlib.pyplot as plt
 import shap  # optional; only used if checkbox enabled
 
 from scipy.special import logit, expit
-
+# ===== Default blend weights (from 2025-08-13 best run: 5 hits@10) =====
+DEFAULT_WEIGHTS = dict(
+    w_prob=0.101,     # calibrated/base prob term
+    w_overlay=0.025,  # contextual overlay term
+    w_ranker=0.268,   # LambdaRank/learned ranker term
+    w_rrf=0.014,      # Reciprocal Rank Fusion auxiliary term
+    w_penalty=0.592   # model-disagreement penalty (subtracted)
+)
 # ===================== UI =====================
 st.set_page_config(page_title="🏆 MLB Home Run Predictor — Max Power", layout="wide")
 st.title("🏆 MLB Home Run Predictor — Max Power")
