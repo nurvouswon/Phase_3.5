@@ -1010,105 +1010,101 @@ if event_file is not None and today_file is not None:
     # Apply labels for the demo day (replace or create hr_outcome)
     today_df["hr_outcome"] = today_df["player_name"].isin(hr_hitters_aug9).astype(int)
 
-    # ============================================================
-    # ===================== BLEND TUNER ==========================
-    # ============================================================
-    st.markdown("## 🔧 Blend Tuner")
-    if "hr_outcome" not in today_df.columns:
-        st.info("To use the Blend Tuner, your TODAY file must include **hr_outcome** (1 = HR, 0 = no HR).")
-    else:
-        y_true = today_df["hr_outcome"].fillna(0).astype(int).to_numpy()
-        if y_true.sum() == 0 or y_true.sum() == len(y_true):
-            st.warning("Blend Tuner needs a mix of 0s and 1s in hr_outcome. Tuner skipped.")
+        # ============================================================
+        # ===================== POWER BLEND TUNER ====================
+        # ============================================================
+        st.markdown("## 🔧 Power Blend Tuner (Wide Search)")
+        if "hr_outcome" not in today_df.columns:
+                st.info("To use the Blend Tuner, your TODAY file must include **hr_outcome** (1 = HR, 0 = no HR).")
         else:
-            def score_with_weights(wp, wo, wr, wrrf, wpen, a_logit, b_logoverlay, c_ranker, d_rrf, e_pen):
-                return expit(wp*a_logit + wo*b_logoverlay + wr*c_ranker + wrrf*d_rrf - wpen*e_pen)
-
-            def hits_at_k(y, s, K):
-                order = np.argsort(-s)
-                return int(np.sum(y[order][:K]))
-
-            def dcg_at_k(rels, K):
-                rels = np.asarray(rels)[:K]
-                if rels.size == 0: return 0.0
-                discounts = 1.0 / np.log2(np.arange(2, 2 + len(rels)))
-                return float(np.sum(rels * discounts))
-
-            def ndcg_at_k(y, s, K):
-                order = np.argsort(-s)
-                rel_sorted = y[order]
-                dcg = dcg_at_k(rel_sorted, K)
-                ideal = np.sort(y)[::-1]
-                idcg = dcg_at_k(ideal, K)
-                return (dcg / idcg) if idcg > 0 else 0.0
-
-            prob_grid    = [0.50, 0.56, 0.60, 0.65]
-            overlay_grid = [0.12, 0.18, 0.22]
-            rrf_grid     = [0.06, 0.08, 0.10]
-            pen_grid     = [0.10, 0.15, 0.20]
-
-            results = []
-            for wp in prob_grid:
-                for wo in overlay_grid:
-                    for wrrf in rrf_grid:
-                        wr = max(0.05, 1.0 - wp - wo - wrrf - 0.15)  # leave ~0.15 for penalty default
-                        for wpen in pen_grid:
-                            s = score_with_weights(wp, wo, wr, wrrf, wpen,
-                                                   logit_p, log_overlay, ranker_z, rrf_z, dis_penalty)
-                            h10 = hits_at_k(y_true, s, 10)
-                            h20 = hits_at_k(y_true, s, 20)
-                            h30 = hits_at_k(y_true, s, 30)
-                            ndcg30 = ndcg_at_k(y_true, s, 30)
-                            try:
-                                auc = roc_auc_score(y_true, s)
-                            except Exception:
-                                auc = np.nan
-                            results.append({
-                                "w_prob": round(wp, 2),
-                                "w_overlay": round(wo, 2),
-                                "w_ranker": round(wr, 2),
-                                "w_rrf": round(wrrf, 2),
-                                "w_penalty": round(wpen, 2),
-                                "Hits@10": h10,
-                                "Hits@20": h20,
-                                "Hits@30": h30,
-                                "NDCG@30": round(ndcg30, 4),
-                                "AUC": round(float(auc), 4) if np.isfinite(auc) else np.nan
-                            })
-
-            if results:
-                res_df = pd.DataFrame(results).sort_values(
-                    by=["Hits@20", "NDCG@30", "AUC"], ascending=[False, False, False]
-                ).reset_index(drop=True)
-
-                st.subheader("🔎 Weight Search Results (sorted by Hits@20 → NDCG@30 → AUC)")
-                st.dataframe(res_df, use_container_width=True)
-
-                best = res_df.iloc[0]
-                st.success(
-                    f"Best weights: w_prob={best['w_prob']}, w_overlay={best['w_overlay']}, "
-                    f"w_ranker={best['w_ranker']}, w_rrf={best['w_rrf']}, w_penalty={best['w_penalty']} | "
-                    f"Hits@20={best['Hits@20']} • NDCG@30={best['NDCG@30']} • AUC={best['AUC']}"
-                )
-                # Recompute final score using tuned weights
-                score = expit(
-                    best["w_prob"] * logit_p
-                    + best["w_overlay"] * log_overlay
-                    + best["w_ranker"] * ranker_z
-                    + best["w_rrf"] * rrf_z
-                    - best["w_penalty"] * dis_penalty
-                )
-            else:
-                st.warning("No valid weight combinations. Using current score as-is.")
-                st.write("Weights in use:",
-                         {"w_prob": w_prob, "w_overlay": w_overlay, "w_ranker": w_ranker,
-                          "w_rrf": w_rrf, "w_penalty": w_penalty})
-                if "hr_outcome" in today_df.columns:
-                    top30_idx = np.argsort(-score)[:30]
-                    hits_top30 = int(today_df.loc[top30_idx, "hr_outcome"].fillna(0).astype(int).sum())
-                    st.success(f"Hits in Top-30: {hits_top30}/30")
+                y_true = today_df["hr_outcome"].fillna(0).astype(int).to_numpy()
+                if y_true.sum() == 0 or y_true.sum() == len(y_true):
+                        st.warning("Blend Tuner needs a mix of 0s and 1s in hr_outcome. Tuner skipped.")
                 else:
-                    st.info("No hr_outcome in TODAY; tuner skipped, using default weights.")
+                        def score_with_weights(wp, wo, wr, wrrf, wpen, a_logit, b_logoverlay, c_ranker, d_rrf, e_pen):
+                                return expit(wp*a_logit + wo*b_logoverlay + wr*c_ranker + wrrf*d_rrf - wpen*e_pen)
+
+                        def hits_at_k(y, s, K):
+                                order = np.argsort(-s)
+                                return int(np.sum(y[order][:K]))
+
+                        def dcg_at_k(rels, K):
+                                rels = np.asarray(rels)[:K]
+                                if rels.size == 0: return 0.0
+                                discounts = 1.0 / np.log2(np.arange(2, 2 + len(rels)))
+                                return float(np.sum(rels * discounts))
+
+                        def ndcg_at_k(y, s, K):
+                                order = np.argsort(-s)
+                                rel_sorted = y[order]
+                                dcg = dcg_at_k(rel_sorted, K)
+                                ideal = np.sort(y)[::-1]
+                                idcg = dcg_at_k(ideal, K)
+                                return (dcg / idcg) if idcg > 0 else 0.0
+
+                        # --- Wide random search ---
+                        rng = np.random.default_rng(42)
+                        num_samples = 2000
+                        results = []
+                        for _ in range(num_samples):
+                                weights = rng.dirichlet(np.ones(5))
+                                wp, wo, wr, wrrf, wpen = weights
+                                s = score_with_weights(wp, wo, wr, wrrf, wpen,
+                                                        logit_p, log_overlay, ranker_z, rrf_z, dis_penalty)
+                                h10 = hits_at_k(y_true, s, 10)
+                                h20 = hits_at_k(y_true, s, 20)
+                                h30 = hits_at_k(y_true, s, 30)
+                                ndcg30 = ndcg_at_k(y_true, s, 30)
+                                try:
+                                        auc = roc_auc_score(y_true, s)
+                                except Exception:
+                                        auc = np.nan
+                                results.append({
+                                        "w_prob": round(wp, 3),
+                                        "w_overlay": round(wo, 3),
+                                        "w_ranker": round(wr, 3),
+                                        "w_rrf": round(wrrf, 3),
+                                        "w_penalty": round(wpen, 3),
+                                        "Hits@10": h10,
+                                        "Hits@20": h20,
+                                        "Hits@30": h30,
+                                        "NDCG@30": round(ndcg30, 4),
+                                        "AUC": round(float(auc), 4) if np.isfinite(auc) else np.nan
+                                })
+
+                        if results:
+                                res_df = pd.DataFrame(results).sort_values(
+                                        by=["Hits@20", "NDCG@30", "AUC"], ascending=[False, False, False]
+                                ).reset_index(drop=True)
+
+                                st.subheader("🔎 Weight Search Results (sorted by Hits@20 → NDCG@30 → AUC)")
+                                st.dataframe(res_df.head(50), use_container_width=True)
+
+                                best = res_df.iloc[0]
+                                st.success(
+                                        f"Best weights: w_prob={best['w_prob']}, w_overlay={best['w_overlay']}, "
+                                        f"w_ranker={best['w_ranker']}, w_rrf={best['w_rrf']}, w_penalty={best['w_penalty']} | "
+                                        f"Hits@20={best['Hits@20']} • NDCG@30={best['NDCG@30']} • AUC={best['AUC']}"
+                                )
+                                # Recompute final score using tuned weights
+                                score = expit(
+                                        best["w_prob"] * logit_p
+                                        + best["w_overlay"] * log_overlay
+                                        + best["w_ranker"] * ranker_z
+                                        + best["w_rrf"] * rrf_z
+                                        - best["w_penalty"] * dis_penalty
+                                )
+                        else:
+                                st.warning("No valid weight combinations. Using current score as-is.")
+                                st.write("Weights in use:",
+                                         {"w_prob": w_prob, "w_overlay": w_overlay, "w_ranker": w_ranker,
+                                          "w_rrf": w_rrf, "w_penalty": w_penalty})
+                                if "hr_outcome" in today_df.columns:
+                                        top30_idx = np.argsort(-score)[:30]
+                                        hits_top30 = int(today_df.loc[top30_idx, "hr_outcome"].fillna(0).astype(int).sum())
+                                        st.success(f"Hits in Top-30: {hits_top30}/30")
+                                else:
+                                        st.info("No hr_outcome in TODAY; tuner skipped, using default weights.")
     # ================= Leaderboard Build & Outputs =================
     def build_leaderboard(df, calibrated_probs, final_score, label="calibrated_hr_probability"):
         df = df.copy()
