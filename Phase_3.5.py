@@ -311,11 +311,12 @@ def overlay_multiplier(row):
     p_fb = _first_present(row, "p_fb_rate", [14,7,5])
 
     roof_closed = ("closed" in roof) or ("indoor" in roof) or ("domed" in roof)
+
     # Synergy: if pitcher is fly-ball leaning and weather is favorable, nudge up a bit
-    p_fb = _first_present(row, "p_fb_rate", [14,7,5])
     if pd.notnull(p_fb) and float(p_fb) >= 0.40:
         if (pd.notnull(temp) and temp >= 75) and (pd.notnull(wind) and wind >= 7 and "out" in wind_dir) and not roof_closed:
             edge *= 1.02  # small, controlled nudge
+
     if pd.notnull(altitude):
         if altitude >= 5000: edge *= 1.05
         elif altitude >= 3000: edge *= 1.02
@@ -461,14 +462,14 @@ def weak_pitcher_factor(row):
     hr3   = _get("p_rolling_hr_3", "p_hr_count_3")
     pa3   = _get("p_rolling_pa_3")
     if pd.notnull(hr3) and pd.notnull(pa3) and pa3 > 0:
-        hr_rate_short = float(hr3) / float(pa3)              # HR per PA last few games
-        ss_shrink = min(1.0, pa3 / 30.0)                    # shrink if <30 PA sample
+        hr_rate_short = float(hr3) / float(pa3)
+        ss_shrink = min(1.0, pa3 / 30.0)
         if hr_rate_short >= 0.10:
-            factor *= (1.12 * (0.5 + 0.5 * ss_shrink))      # up to ~1.12 when sample is decent
+            factor *= (1.12 * (0.5 + 0.5 * ss_shrink))
         elif hr_rate_short >= 0.07:
             factor *= (1.06 * (0.5 + 0.5 * ss_shrink))
 
-    # --- Quality of contact allowed (14g/30g rolling if present)
+    # --- Quality of contact allowed
     brl14 = _get("p_fs_barrel_rate_14", "p_barrel_rate_14", "p_hard_hit_rate_14")
     brl30 = _get("p_fs_barrel_rate_30", "p_barrel_rate_30", "p_hard_hit_rate_30")
     qoc = np.nanmax([brl14, brl30]) if any(pd.notnull(x) for x in [brl14, brl30]) else np.nan
@@ -477,16 +478,16 @@ def weak_pitcher_factor(row):
         if v >= 0.11: factor *= 1.07
         elif v >= 0.09: factor *= 1.04
 
-    # --- Fly ball & ground ball profile (more air = more HR risk)
+    # --- Fly/ground ball profile
     fb14 = _get("p_fb_rate_14", "p_fb_rate_7", "p_fb_rate", "p_fb_pct")
     gb14 = _get("p_gb_rate_14", "p_gb_rate_7", "p_gb_rate", "p_gb_pct")
     if pd.notnull(fb14):
         if float(fb14) >= 0.42: factor *= 1.04
         elif float(fb14) >= 0.38: factor *= 1.02
     if pd.notnull(gb14):
-        if float(gb14) <= 0.40: factor *= 1.02             # low GB adds a touch
+        if float(gb14) <= 0.40: factor *= 1.02
 
-    # --- Command & damage proxies (walks add traffic; xwOBA on contact adds damage)
+    # --- Command & damage proxies
     bb_rate = _get("p_bb_rate_14", "p_bb_rate_30", "p_bb_rate")
     xwoba_con = _get("p_xwoba_con_14", "p_xwoba_con_30", "p_xwoba_con")
     if pd.notnull(bb_rate) and float(bb_rate) >= 0.09:
@@ -495,16 +496,15 @@ def weak_pitcher_factor(row):
         if float(xwoba_con) >= 0.40: factor *= 1.05
         elif float(xwoba_con) >= 0.36: factor *= 1.03
 
-    # --- Velocity/shape degradation (optional)
+    # --- Velocity/shape degradation
     ev_allowed = _get("p_avg_exit_velo_14", "p_avg_exit_velo_7", "p_avg_exit_velo_30",
                       "p_exit_velocity_avg", "p_avg_exit_velo")
     if pd.notnull(ev_allowed) and float(ev_allowed) >= 90.0:
         factor *= 1.03
 
-    # --- Platoon: pitcher vs batter handedness split (use if present)
+    # --- Platoon: pitcher vs batter handedness split
     b_hand = str(_get("stand", "batter_hand", default="R")).upper()
     p_hand = str(_get("pitcher_hand", "p_throws", default="R")).upper()
-    # pitcher platoon HR/PA rolling (e.g., p_hr_pa_vl_30, p_hr_pa_vr_30)
     if b_hand == "L":
         p_platoon_hr = _get("p_hr_pa_vl_30", "p_hr_pa_vl_14", "p_hr_pa_vl")
     else:
@@ -514,11 +514,10 @@ def weak_pitcher_factor(row):
         if v >= 0.06: factor *= 1.05
         elif v >= 0.04: factor *= 1.03
 
-    # Small edge if pitcher throws opposite hand (typical platoon)
+    # Small edge if opposite hands
     if (b_hand == "L" and p_hand == "R") or (b_hand == "R" and p_hand == "L"):
         factor *= 1.015
 
-    # --- Final bounds to avoid runaway boosts
     return float(np.clip(factor, 0.90, 1.18))
 
 def short_term_hot_factor(row):
@@ -803,8 +802,6 @@ if event_file is not None and today_file is not None:
         X_tr, X_va = X.iloc[tr_idx], X.iloc[va_idx]
         y_tr, y_va = y.iloc[tr_idx], y.iloc[va_idx]
 
-        # (keeping label smoothing for robustness; remove if you prefer)
-        y_tr_s = smooth_labels(y_tr.values, smoothing=0.02)
         spw_fold = max(1.0, (len(y_tr)-y_tr.sum())/max(1.0, y_tr.sum()))
 
         preds_xgb_va, preds_lgb_va, preds_cat_va = [], [], []
