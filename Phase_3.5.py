@@ -1026,9 +1026,6 @@ if event_file is not None and today_file is not None:
     p_base = (1.0 - alpha) * np.clip(p_base, 1e-6, 1-1e-6) + alpha * base_rate
     logit_p = logit(np.clip(p_base, 1e-6, 1-1e-6))
 
-    # Final blended score using tuner or saved weights
-    score = _blend_score(use_weights, logit_p, log_overlay, ranker_z, rrf_z, dis_penalty)
-
     # ========== (Optional) Auto-fill Aug 9 HR labels for quick tuning demo ==========
     hr_hitters_aug9 = {
         "Junior Caminero","Ernie Clement","Julio Rodríguez","Cal Raleigh","Shohei Ohtani","Max Muncy",
