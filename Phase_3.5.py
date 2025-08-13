@@ -1046,8 +1046,8 @@ if event_file is not None and today_file is not None:
                 return (dcg / idcg) if idcg > 0 else 0.0
 
             # ---------- Wide random search over weights (sum to 1) ----------
-            # You can make this larger for a deeper search.
-            num_samples = st.slider("Tuner: number of random weight samples", 500, 5000, 2000, 500)
+            # You can raise/lower this, but it's automatic (no UI)
+            num_samples = 10000
             rng = np.random.default_rng(42)
 
             results = []
